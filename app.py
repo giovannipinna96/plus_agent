@@ -9,8 +9,8 @@ from typing import Dict, Any, Optional, List
 from pathlib import Path
 
 # Import core components
-from plus_agent.core.config import config
-from plus_agent.core.orchestrator import MultiAgentOrchestrator
+from core.config import config
+from core.orchestrator import MultiAgentOrchestrator
 
 # Initialize the orchestrator
 orchestrator = None
