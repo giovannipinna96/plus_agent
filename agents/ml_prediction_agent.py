@@ -3,8 +3,11 @@
 from typing import List, Dict, Any
 from langchain.agents import create_react_agent, AgentExecutor
 from langchain.prompts import PromptTemplate
-from plus_agent.core.llm_wrapper import llm_wrapper
-from plus_agent.tools.ml_tools import train_regression_model, train_svm_model, train_random_forest_model, train_knn_model, evaluate_model
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core.llm_wrapper import llm_wrapper
+from tools.ml_tools import train_regression_model, train_svm_model, train_random_forest_model, train_knn_model, evaluate_model
 
 
 class MLPredictionAgent:

@@ -5,18 +5,25 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from typing import Dict, Any, Optional
 from langchain.llms.base import LLM
 from langchain.callbacks.manager import CallbackManagerForLLMRun
-from plus_agent.core.config import config
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core.config import config
 
 
 class HuggingFaceLLM(LLM):
     """Custom LangChain LLM wrapper for Hugging Face models."""
-    
-    model_name: str
+
+    model_name: str = ""
     pipeline_instance: Optional[Any] = None
-    
+
     def __init__(self, model_name: str = None, **kwargs):
+        # Set model_name before calling super().__init__
+        if model_name:
+            kwargs['model_name'] = model_name
+        else:
+            kwargs['model_name'] = config.model_name
         super().__init__(**kwargs)
-        self.model_name = model_name or config.model_name
         self._initialize_pipeline()
     
     def _initialize_pipeline(self):

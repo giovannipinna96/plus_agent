@@ -4,7 +4,10 @@ from typing import List, Dict, Any
 from langchain.agents import create_react_agent, AgentExecutor
 from langchain.prompts import PromptTemplate
 from langchain.tools import tool
-from plus_agent.core.llm_wrapper import llm_wrapper
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core.llm_wrapper import llm_wrapper
 
 
 @tool

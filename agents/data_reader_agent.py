@@ -3,8 +3,11 @@
 from typing import List, Dict, Any
 from langchain.agents import create_react_agent, AgentExecutor
 from langchain.prompts import PromptTemplate
-from plus_agent.core.llm_wrapper import llm_wrapper
-from plus_agent.tools.data_tools import read_csv_file, read_json_file, get_column_info, get_data_summary, preview_data
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core.llm_wrapper import llm_wrapper
+from tools.data_tools import read_csv_file, read_json_file, get_column_info, get_data_summary, preview_data
 
 
 class DataReaderAgent:

@@ -7,14 +7,18 @@ from langgraph.types import Command
 import json
 
 # Import agents
-from plus_agent.agents.planner_agent import PlannerAgent
-from plus_agent.agents.data_reader_agent import DataReaderAgent
-from plus_agent.agents.data_manipulation_agent import DataManipulationAgent
-from plus_agent.agents.data_operations_agent import DataOperationsAgent
-from plus_agent.agents.ml_prediction_agent import MLPredictionAgent
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from agents.planner_agent import PlannerAgent
+from agents.data_reader_agent import DataReaderAgent
+from agents.data_manipulation_agent import DataManipulationAgent
+from agents.data_operations_agent import DataOperationsAgent
+from agents.ml_prediction_agent import MLPredictionAgent
 
 # Import LangSmith integration
-from plus_agent.core.langsmith_integration import trace_workflow_execution, trace_agent_execution, langsmith_logger
+from core.langsmith_integration import trace_workflow_execution, trace_agent_execution, langsmith_logger
 
 
 class MultiAgentState(MessagesState):

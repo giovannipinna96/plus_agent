@@ -5,6 +5,15 @@ import numpy as np
 from typing import Dict, Any, List, Optional, Union
 from langchain.tools import tool
 
+# Import Titanic-specific tools
+from .titanic_specific_tools import (
+    calculate_survival_rate_by_group,
+    get_statistics_for_profile,
+    calculate_survival_probability_by_features,
+    get_fare_estimate_by_profile,
+    count_passengers_by_criteria
+)
+
 
 @tool
 def filter_data(file_path: str, column_name: str, condition: str, value: Union[str, float, int]) -> str:

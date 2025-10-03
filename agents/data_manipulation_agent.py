@@ -3,8 +3,11 @@
 from typing import List, Dict, Any
 from langchain.agents import create_react_agent, AgentExecutor
 from langchain.prompts import PromptTemplate
-from plus_agent.core.llm_wrapper import llm_wrapper
-from plus_agent.tools.manipulation_tools import create_dummy_variables, modify_column_values, handle_missing_values, convert_data_types
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core.llm_wrapper import llm_wrapper
+from tools.manipulation_tools import create_dummy_variables, modify_column_values, handle_missing_values, convert_data_types
 
 
 class DataManipulationAgent:
