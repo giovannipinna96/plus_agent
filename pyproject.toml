@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "accelerate>=1.10.1",
+    "bitsandbytes>=0.48.1",
     "datasets>=4.1.1",
     "gradio>=5.46.1",
     "joblib>=1.5.2",
@@ -18,6 +19,8 @@ dependencies = [
     "python-dotenv>=1.1.1",
     "scikit-learn>=1.7.2",
     "seaborn>=0.13.2",
+    "smolagents[docker,gradio,toolkit,transformers,vllm]>=1.22.0",
     "torch>=2.8.0",
     "transformers>=4.56.2",
+    "triton>=3.4.0",
 ]

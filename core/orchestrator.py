@@ -2,9 +2,12 @@
 
 from typing import Dict, Any, List, Optional, Literal
 from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import BaseMessage
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.types import Command
 import json
+
+from pydantic import Field
 
 # Import agents
 import sys
@@ -20,14 +23,13 @@ from agents.ml_prediction_agent import MLPredictionAgent
 # Import LangSmith integration
 from core.langsmith_integration import trace_workflow_execution, trace_agent_execution, langsmith_logger
 
-
 class MultiAgentState(MessagesState):
     """Extended state for multi-agent workflow."""
     current_file_path: Optional[str] = None
     execution_plan: Optional[str] = None
-    completed_steps: List[str] = []
+    completed_steps: List[str] = Field(default_factory=list)
     current_agent: Optional[str] = None
-    results: Dict[str, Any] = {}
+    results: Dict[str, Any] = Field(default_factory=dict)
 
 
 class MultiAgentOrchestrator:
@@ -65,39 +67,59 @@ class MultiAgentOrchestrator:
         workflow.add_edge("data_manipulation", "supervisor")
         workflow.add_edge("data_operations", "supervisor")
         workflow.add_edge("ml_prediction", "supervisor")
+        workflow.add_edge("supervisor", END)
         
         return workflow.compile()
     
     def _planner_node(self, state: MultiAgentState) -> Dict[str, Any]:
         """Execute the planner agent."""
         try:
+            print(f"\n{'='*60}")
+            print(f"🎭 PLANNER AGENT STARTING")
+            print(f"{'='*60}")
+
             # Get the user's original message
             user_message = None
             for message in state["messages"]:
                 if isinstance(message, HumanMessage):
                     user_message = message.content
                     break
-            
+
             if not user_message:
+                print("❌ No user message found in state")
                 return {
                     "messages": [AIMessage(content="No user message found.")],
                     "current_agent": "planner",
                     "execution_plan": "No plan created"
                 }
-            
+
+            print(f"📝 User message: {user_message[:100]}...")
+            print(f"🔄 Calling planner agent...")
+
             # Create execution plan
+            import time
+            start_time = time.time()
             result = self.planner.plan(user_message)
-            
+            exec_time = time.time() - start_time
+
             plan_message = AIMessage(content=f"Planning Agent: {result.get('plan', 'Planning failed')}")
-            
+
+            print(f"✅ PLANNER AGENT COMPLETED in {exec_time:.2f}s")
+            print(f"   Status: {result.get('status')}")
+            print(f"   Plan length: {len(result.get('plan', ''))} characters")
+            print(f"{'='*60}\n")
+
             return {
                 "messages": [plan_message],
                 "execution_plan": result.get("plan", ""),
                 "current_agent": "planner",
                 "results": {"planner": result}
             }
-            
+
         except Exception as e:
+            print(f"❌ PLANNER AGENT ERROR: {str(e)}")
+            import traceback
+            traceback.print_exc()
             error_message = AIMessage(content=f"Planner Agent Error: {str(e)}")
             return {
                 "messages": [error_message],
@@ -108,19 +130,39 @@ class MultiAgentOrchestrator:
     def _data_reader_node(self, state: MultiAgentState) -> Dict[str, Any]:
         """Execute the data reader agent."""
         try:
+            print(f"\n{'='*60}")
+            print(f"📊 DATA READER AGENT STARTING")
+            print(f"{'='*60}")
+
             file_path = state.get("current_file_path", "data/titanic.csv")
-            
+            print(f"📁 File path: {file_path}")
+            print(f"🔄 Calling data reader agent...")
+
+            import time
+            start_time = time.time()
             result = self.data_reader.analyze_data(file_path, "comprehensive")
-            
+            exec_time = time.time() - start_time
+
             reader_message = AIMessage(content=f"Data Reader Agent: {result.get('analysis', 'Analysis failed')}")
-            
+
+            print(f"✅ DATA READER AGENT COMPLETED in {exec_time:.2f}s")
+            print(f"   Status: {result.get('status')}")
+            if result.get('status') == 'success':
+                print(f"   Analysis length: {len(result.get('analysis', ''))} characters")
+            else:
+                print(f"   Error: {result.get('error', 'Unknown error')}")
+            print(f"{'='*60}\n")
+
             return {
                 "messages": [reader_message],
                 "current_agent": "data_reader",
                 "results": {**state.get("results", {}), "data_reader": result}
             }
-            
+
         except Exception as e:
+            print(f"❌ DATA READER AGENT ERROR: {str(e)}")
+            import traceback
+            traceback.print_exc()
             error_message = AIMessage(content=f"Data Reader Agent Error: {str(e)}")
             return {
                 "messages": [error_message],
@@ -131,22 +173,43 @@ class MultiAgentOrchestrator:
     def _data_manipulation_node(self, state: MultiAgentState) -> Dict[str, Any]:
         """Execute the data manipulation agent."""
         try:
+            print(f"\n{'='*60}")
+            print(f"🔧 DATA MANIPULATION AGENT STARTING")
+            print(f"{'='*60}")
+
             file_path = state.get("current_file_path", "data/titanic.csv")
-            
+
             # Extract manipulation request from messages or use default
             manipulation_request = "Handle missing values and prepare data for analysis"
-            
+            print(f"📁 File path: {file_path}")
+            print(f"📋 Request: {manipulation_request}")
+            print(f"🔄 Calling data manipulation agent...")
+
+            import time
+            start_time = time.time()
             result = self.data_manipulation.manipulate_data(file_path, manipulation_request)
-            
+            exec_time = time.time() - start_time
+
             manipulation_message = AIMessage(content=f"Data Manipulation Agent: {result.get('result', 'Manipulation failed')}")
-            
+
+            print(f"✅ DATA MANIPULATION AGENT COMPLETED in {exec_time:.2f}s")
+            print(f"   Status: {result.get('status')}")
+            if result.get('status') == 'success':
+                print(f"   Result length: {len(result.get('result', ''))} characters")
+            else:
+                print(f"   Error: {result.get('error', 'Unknown error')}")
+            print(f"{'='*60}\n")
+
             return {
                 "messages": [manipulation_message],
                 "current_agent": "data_manipulation",
                 "results": {**state.get("results", {}), "data_manipulation": result}
             }
-            
+
         except Exception as e:
+            print(f"❌ DATA MANIPULATION AGENT ERROR: {str(e)}")
+            import traceback
+            traceback.print_exc()
             error_message = AIMessage(content=f"Data Manipulation Agent Error: {str(e)}")
             return {
                 "messages": [error_message],
@@ -157,22 +220,43 @@ class MultiAgentOrchestrator:
     def _data_operations_node(self, state: MultiAgentState) -> Dict[str, Any]:
         """Execute the data operations agent."""
         try:
+            print(f"\n{'='*60}")
+            print(f"⚡ DATA OPERATIONS AGENT STARTING")
+            print(f"{'='*60}")
+
             file_path = state.get("current_file_path", "data/titanic.csv")
-            
+
             # Extract operation request from messages or use default
             operation_request = "Analyze data patterns and perform basic statistical operations"
-            
+            print(f"📁 File path: {file_path}")
+            print(f"📋 Request: {operation_request}")
+            print(f"🔄 Calling data operations agent...")
+
+            import time
+            start_time = time.time()
             result = self.data_operations.perform_operations(file_path, operation_request)
-            
+            exec_time = time.time() - start_time
+
             operations_message = AIMessage(content=f"Data Operations Agent: {result.get('result', 'Operations failed')}")
-            
+
+            print(f"✅ DATA OPERATIONS AGENT COMPLETED in {exec_time:.2f}s")
+            print(f"   Status: {result.get('status')}")
+            if result.get('status') == 'success':
+                print(f"   Result length: {len(result.get('result', ''))} characters")
+            else:
+                print(f"   Error: {result.get('error', 'Unknown error')}")
+            print(f"{'='*60}\n")
+
             return {
                 "messages": [operations_message],
                 "current_agent": "data_operations",
                 "results": {**state.get("results", {}), "data_operations": result}
             }
-            
+
         except Exception as e:
+            print(f"❌ DATA OPERATIONS AGENT ERROR: {str(e)}")
+            import traceback
+            traceback.print_exc()
             error_message = AIMessage(content=f"Data Operations Agent Error: {str(e)}")
             return {
                 "messages": [error_message],
@@ -183,22 +267,43 @@ class MultiAgentOrchestrator:
     def _ml_prediction_node(self, state: MultiAgentState) -> Dict[str, Any]:
         """Execute the ML prediction agent."""
         try:
+            print(f"\n{'='*60}")
+            print(f"🎯 ML PREDICTION AGENT STARTING")
+            print(f"{'='*60}")
+
             file_path = state.get("current_file_path", "data/titanic.csv")
-            
+
             # Extract ML request from messages or use default
             ml_request = "Train a classification model to predict the target variable"
-            
+            print(f"📁 File path: {file_path}")
+            print(f"📋 Request: {ml_request}")
+            print(f"🔄 Calling ML prediction agent...")
+
+            import time
+            start_time = time.time()
             result = self.ml_prediction.train_model(file_path, ml_request)
-            
+            exec_time = time.time() - start_time
+
             ml_message = AIMessage(content=f"ML Prediction Agent: {result.get('result', 'ML training failed')}")
-            
+
+            print(f"✅ ML PREDICTION AGENT COMPLETED in {exec_time:.2f}s")
+            print(f"   Status: {result.get('status')}")
+            if result.get('status') == 'success':
+                print(f"   Result length: {len(result.get('result', ''))} characters")
+            else:
+                print(f"   Error: {result.get('error', 'Unknown error')}")
+            print(f"{'='*60}\n")
+
             return {
                 "messages": [ml_message],
                 "current_agent": "ml_prediction",
                 "results": {**state.get("results", {}), "ml_prediction": result}
             }
-            
+
         except Exception as e:
+            print(f"❌ ML PREDICTION AGENT ERROR: {str(e)}")
+            import traceback
+            traceback.print_exc()
             error_message = AIMessage(content=f"ML Prediction Agent Error: {str(e)}")
             return {
                 "messages": [error_message],

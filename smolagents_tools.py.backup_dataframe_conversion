@@ -1,0 +1,3764 @@
+
+import os
+import json
+import pandas as pd
+import numpy as np
+from typing import Dict, Any, List, Optional, Union
+from dotenv import load_dotenv
+
+# Machine Learning imports
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.svm import SVC, SVR
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, GradientBoostingClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, mean_squared_error, r2_score, roc_auc_score
+from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+import joblib
+
+# Statistical imports
+from scipy.stats import pearsonr, spearmanr, ttest_ind, chi2_contingency
+from scipy import stats
+
+# Visualization imports
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# smolagents imports
+from smolagents import CodeAgent, InferenceClientModel, tool, TransformersModel
+
+# Import Titanic questions for interactive menu
+from titanic_questions import TITANIC_QUESTIONS
+
+# Load environment variables
+load_dotenv()
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+CONFIG = {
+    # "model_id": os.getenv("MODEL_NAME", "deepseek-ai/deepseek-coder-7b-instruct-v1.5"),
+    "model_id": os.getenv("MODEL_NAME", "Qwen/Qwen2.5-Coder-7B-Instruct"),
+    "max_new_tokens": int(os.getenv("MAX_TOKENS", "1024")),
+    "temperature": float(os.getenv("TEMPERATURE", "0.1")),
+    "default_dataset": os.getenv("DEFAULT_DATASET_PATH", "data/titanic.csv"),
+    "huggingface_token": os.getenv("HUGGINGFACE_TOKEN"),
+}
+
+print(f"🚀 Multi-Agent System Configuration:")
+print(f"   Model: {CONFIG['model_id']}")
+print(f"   Max Tokens: {CONFIG['max_new_tokens']}")
+print(f"   Temperature: {CONFIG['temperature']}")
+print(f"   Default Dataset: {CONFIG['default_dataset']}")
+
+
+# ============================================================================
+# CUSTOM EXCEPTIONS FOR LLM (TODO #6: Detailed Error Messages)
+# ============================================================================
+
+class ToolException(Exception):
+    """
+    Base exception for all tool errors - designed for LLM consumption.
+
+    All error messages follow a structured format that helps LLMs understand:
+    - WHAT went wrong (problem description)
+    - WHERE it happened (context with tool name and parameters)
+    - WHY it failed (root cause explanation)
+    - HOW to fix it (actionable solution)
+    - EXAMPLE of correct usage
+    """
+
+    def __init__(self, problem: str, context: dict, cause: str, solution: str, example: str = None):
+        self.problem = problem
+        self.context = context
+        self.cause = cause
+        self.solution = solution
+        self.example = example
+
+        # Build structured message for LLM
+        msg_parts = [
+            f"[{self.__class__.__name__}] PROBLEM: {problem}",
+            f"CONTEXT: Tool={context.get('tool_name', 'unknown')}, Parameters={context.get('parameters', {})}",
+            f"CAUSE: {cause}",
+            f"SOLUTION: {solution}"
+        ]
+
+        if example:
+            msg_parts.append(f"EXAMPLE OF CORRECT USAGE:\n{example}")
+
+        message = "\n".join(msg_parts)
+        super().__init__(message)
+
+
+class ColumnNotFoundError(ToolException):
+    """Column specified does not exist in the DataFrame."""
+
+    def __init__(self, column_name: str, available_columns: list, tool_name: str, operation: str):
+        problem = f"Column '{column_name}' does not exist in the DataFrame"
+
+        context = {
+            "tool_name": tool_name,
+            "parameters": {
+                "requested_column": column_name,
+                "operation": operation
+            }
+        }
+
+        cause = (
+            f"The column name '{column_name}' was not found in the DataFrame. "
+            f"Available columns are: {available_columns}. "
+            f"Common reasons: (1) Typo in column name - column names are case-sensitive, "
+            f"(2) Column was removed/renamed in a previous operation, "
+            f"(3) Wrong dataset loaded, "
+            f"(4) Using lowercase when column has uppercase letters or vice versa."
+        )
+
+        solution = (
+            f"IMMEDIATE ACTION: Use one of these existing column names: {available_columns}. "
+            f"DIAGNOSTIC STEPS: "
+            f"1. Call 'get_column_info' tool first to see all available columns and their exact names. "
+            f"2. Check for case sensitivity - 'Age' is different from 'age'. "
+            f"3. If you need this column, create it first using 'create_new_feature' or 'modify_column_values' tools. "
+            f"4. Review previous operations to see if column was dropped or renamed."
+        )
+
+        example = f"""
+# Step 1: First check available columns
+column_info = get_column_info(file_path="data.csv")
+# This will show you exact column names
+
+# Step 2: Use correct column name (case-sensitive!)
+result = {tool_name}(file_path="data.csv", column_name="{available_columns[0] if available_columns else 'existing_column'}", ...)
+
+# If column doesn't exist, create it first:
+new_df = create_new_feature(file_path="data.csv", new_column="{column_name}", ...)
+"""
+
+        super().__init__(problem, context, cause, solution, example)
+
+
+class InvalidOperatorError(ToolException):
+    """Operator provided is not valid for the operation."""
+
+    def __init__(self, operator: str, valid_operators: list, tool_name: str, column_type: str = None):
+        problem = f"Invalid operator '{operator}' for this operation"
+
+        context = {
+            "tool_name": tool_name,
+            "parameters": {
+                "provided_operator": operator,
+                "column_type": column_type,
+                "valid_operators": valid_operators
+            }
+        }
+
+        cause = (
+            f"The operator '{operator}' is not recognized or not supported. "
+            f"Valid operators for this operation are: {valid_operators}. "
+        )
+
+        if column_type:
+            cause += (
+                f"For column type '{column_type}': "
+                f"- Use '>', '<', '>=', '<=' for numeric comparisons. "
+                f"- Use '==' or '!=' for equality checks on any type. "
+                f"- String comparisons should use '==' or '!='."
+            )
+
+        solution = (
+            f"IMMEDIATE ACTION: Replace '{operator}' with one of these valid operators: {valid_operators}. "
+            f"OPERATOR GUIDE: "
+            f"- '>' : Greater than (numeric only) "
+            f"- '<' : Less than (numeric only) "
+            f"- '>=' : Greater than or equal (numeric only) "
+            f"- '<=' : Less than or equal (numeric only) "
+            f"- '==' : Equal to (any type) "
+            f"- '!=' : Not equal to (any type)"
+        )
+
+        example = f"""
+# For numeric comparisons:
+result = {tool_name}(file_path="data.csv", column="age", operator=">", value=30)
+result = {tool_name}(file_path="data.csv", column="fare", operator="<=", value=50.0)
+
+# For categorical/string comparisons:
+result = {tool_name}(file_path="data.csv", column="city", operator="==", value="London")
+result = {tool_name}(file_path="data.csv", column="status", operator="!=", value="inactive")
+"""
+
+        super().__init__(problem, context, cause, solution, example)
+
+
+class DataTypeError(ToolException):
+    """Data type incompatible with the requested operation."""
+
+    def __init__(self, column_name: str, expected_type: str, actual_type: str, tool_name: str, operation: str):
+        problem = f"Incompatible data type for column '{column_name}'"
+
+        context = {
+            "tool_name": tool_name,
+            "parameters": {
+                "column_name": column_name,
+                "operation": operation,
+                "expected_type": expected_type,
+                "actual_type": actual_type
+            }
+        }
+
+        cause = (
+            f"Column '{column_name}' has type '{actual_type}', but operation '{operation}' requires '{expected_type}'. "
+            f"TYPE MISMATCH DETAILS: "
+            f"- Cannot perform mathematical operations (>, <, +, -, *, /) on text/string columns. "
+            f"- Cannot perform string operations (concatenation, substring) on numeric columns. "
+            f"- Statistical operations (mean, median, std) require numeric data. "
+            f"This error occurs when the column content doesn't match the operation requirements."
+        )
+
+        solution = (
+            f"CHOOSE ONE OF THESE SOLUTIONS: "
+            f"\n1. CONVERT THE COLUMN TYPE (if conversion makes sense): "
+            f"   Use 'convert_data_types' tool to change '{column_name}' from '{actual_type}' to '{expected_type}'. "
+            f"\n2. USE A DIFFERENT COLUMN: "
+            f"   Call 'get_column_info' to find columns that already have type '{expected_type}'. "
+            f"\n3. MODIFY THE OPERATION: "
+            f"   Choose an operation compatible with '{actual_type}' data."
+        )
+
+        example = f"""
+# Solution 1: Convert column type first
+converted = convert_data_types(file_path="data.csv", column_name="{column_name}", target_type="{expected_type}")
+# Now use the converted dataset
+result = {tool_name}(file_path="data_converted.csv", column_name="{column_name}", ...)
+
+# Solution 2: Check column types and use appropriate column
+column_info = get_column_info(file_path="data.csv")
+# Find a column with type {expected_type}, then use it
+
+# Solution 3: Use operation compatible with {actual_type}
+# For text columns: use string_operations tool
+# For numeric columns: use perform_math_operations tool
+"""
+
+        super().__init__(problem, context, cause, solution, example)
+
+
+class MissingValuesError(ToolException):
+    """Operation cannot proceed due to missing/null values."""
+
+    def __init__(self, column_name: str, null_count: int, total_rows: int, tool_name: str):
+        problem = f"Column '{column_name}' contains {null_count} missing values ({null_count/total_rows*100:.1f}% of data)"
+
+        context = {
+            "tool_name": tool_name,
+            "parameters": {
+                "column_name": column_name,
+                "null_count": null_count,
+                "total_rows": total_rows,
+                "null_percentage": f"{null_count/total_rows*100:.1f}%"
+            }
+        }
+
+        cause = (
+            f"The operation '{tool_name}' cannot proceed because column '{column_name}' has {null_count} missing (null/NaN) values out of {total_rows} total rows. "
+            f"IMPACT: Missing values cause failures in: "
+            f"- Mathematical operations (cannot calculate mean, sum, etc. with NaN) "
+            f"- Machine learning models (most ML algorithms reject NaN values) "
+            f"- Comparisons and filtering (NaN != NaN, causing unexpected results) "
+            f"Missing data must be handled before proceeding."
+        )
+
+        solution = (
+            f"REQUIRED: Handle missing values using 'handle_missing_values' tool. "
+            f"CHOOSE APPROPRIATE METHOD BASED ON DATA: "
+            f"\nFor NUMERIC columns like {column_name}: "
+            f"  - method='mean': Replace NaN with column average (good for normally distributed data) "
+            f"  - method='median': Replace NaN with median (robust to outliers) "
+            f"  - method='zero': Replace NaN with 0 (when 0 is meaningful) "
+            f"\nFor CATEGORICAL/TEXT columns: "
+            f"  - method='mode': Replace NaN with most frequent value "
+            f"  - method='constant': Replace NaN with a specific value like 'Unknown' "
+            f"\nOther options: "
+            f"  - method='drop': Remove rows with NaN (use if <5% of data) "
+            f"  - method='ffill' or 'bfill': Forward/backward fill (for time series)"
+        )
+
+        example = f"""
+# Step 1: Handle missing values first
+cleaned = handle_missing_values(
+    file_path="data.csv",
+    column_name="{column_name}",
+    method="mean"  # or "median", "mode", "drop", etc.
+)
+
+# Step 2: Now proceed with your operation on cleaned data
+result = {tool_name}(file_path="data_cleaned.csv", column_name="{column_name}", ...)
+
+# Alternative: Check which columns have missing values
+summary = get_data_summary(file_path="data.csv")
+# This shows null counts for all columns
+"""
+
+        super().__init__(problem, context, cause, solution, example)
+
+
+class InsufficientDataError(ToolException):
+    """Not enough data rows to perform the operation."""
+
+    def __init__(self, required_rows: int, actual_rows: int, tool_name: str, operation: str):
+        problem = f"Insufficient data: need at least {required_rows} rows, but dataset has only {actual_rows} rows"
+
+        context = {
+            "tool_name": tool_name,
+            "parameters": {
+                "operation": operation,
+                "required_rows": required_rows,
+                "actual_rows": actual_rows,
+                "deficit": required_rows - actual_rows
+            }
+        }
+
+        cause = (
+            f"The operation '{operation}' requires a minimum of {required_rows} data rows, "
+            f"but the current dataset contains only {actual_rows} rows ({required_rows - actual_rows} rows short). "
+            f"COMMON CAUSES: "
+            f"- Previous filtering operations were too restrictive and removed too much data "
+            f"- Multiple filters were combined with AND logic when OR logic would be better "
+            f"- The original dataset is too small for this type of analysis "
+            f"- Wrong dataset was loaded"
+        )
+
+        solution = (
+            f"DIAGNOSTIC STEPS: "
+            f"\n1. REVIEW PREVIOUS FILTERS: "
+            f"   Check if recent filter_data operations removed too many rows. "
+            f"   Consider using broader filter criteria or OR conditions instead of AND. "
+            f"\n2. CHECK ORIGINAL DATASET SIZE: "
+            f"   Call get_data_summary on the original file to see initial row count. "
+            f"   If original data is small, you may need more data or a different approach. "
+            f"\n3. ALTERNATIVE APPROACHES FOR SMALL DATASETS: "
+            f"   - Use simpler analysis methods that work with fewer data points "
+            f"   - Combine categories to reduce data fragmentation "
+            f"   - Skip operations that require large samples (like train/test splits with 80/20)"
+        )
+
+        example = f"""
+# Step 1: Check current dataset size
+summary = get_data_summary(file_path="current_data.csv")
+# If too few rows, check filtering steps
+
+# Step 2: Relax filter criteria
+# Instead of multiple strict filters:
+# filter(age > 30) AND filter(fare > 100) AND filter(class == 1)  ← Too restrictive!
+
+# Try broader single filter or OR logic:
+filter(age > 25)  # Broader criteria
+# Or use the original dataset if filters removed too much
+
+# Step 3: For ML operations, reduce train/test split if needed
+# Instead of 80/20 split, try 70/30 or even 60/40 for small datasets
+"""
+
+        super().__init__(problem, context, cause, solution, example)
+
+
+# ============================================================================
+# TOOL TRACKING SYSTEM (TODO #5: Track Tool Calls)
+# ============================================================================
+
+import functools
+import time
+from datetime import datetime
+
+# Global variable to store current run tracking data
+_current_run_log = {
+    "run_id": None,
+    "start_time": None,
+    "tool_calls": [],
+    "metadata": {}
+}
+
+
+def track_tool_call(func):
+    """
+    Decorator that tracks every tool call with detailed logging.
+
+    Tracks:
+    - Tool name
+    - Timestamp of invocation
+    - Input parameters (truncated for large data)
+    - Return value summary
+    - Execution time
+    - Success or failure status
+    - Error details if failed
+
+    Usage:
+        @tool
+        @track_tool_call
+        def my_tool(param1, param2):
+            ...
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        # Record call start
+        call_start = time.time()
+        call_timestamp = datetime.now().isoformat()
+
+        tool_name = func.__name__
+
+        # Prepare call log entry
+        call_log = {
+            "tool_name": tool_name,
+            "timestamp": call_timestamp,
+            "args": str(args)[:500],  # Truncate to avoid huge logs
+            "kwargs": {k: str(v)[:200] for k, v in kwargs.items()},
+            "status": "running"
+        }
+
+        # Print visual separator and call info
+        print(f"\n{'='*60}")
+        print(f"🔧 TOOL CALL: {tool_name}")
+        print(f"⏰ Time: {call_timestamp}")
+        print(f"📥 Parameters: {call_log['kwargs']}")
+        print(f"{'='*60}")
+
+        try:
+            # Execute the actual tool
+            result = func(*args, **kwargs)
+
+            # Record success
+            execution_time = time.time() - call_start
+            call_log.update({
+                "status": "success",
+                "execution_time_seconds": round(execution_time, 3),
+                "result_preview": str(result)[:300] if result else "None"
+            })
+
+            print(f"✅ SUCCESS in {execution_time:.3f}s")
+            print(f"📤 Result preview: {call_log['result_preview']}")
+            print(f"{'='*60}\n")
+
+            # Add to global run log
+            _current_run_log["tool_calls"].append(call_log)
+
+            return result
+
+        except Exception as e:
+            # Record error
+            execution_time = time.time() - call_start
+            call_log.update({
+                "status": "error",
+                "execution_time_seconds": round(execution_time, 3),
+                "error_type": type(e).__name__,
+                "error_message": str(e)
+            })
+
+            print(f"❌ ERROR in {execution_time:.3f}s")
+            print(f"🔴 Error: {call_log['error_type']}: {call_log['error_message']}")
+            print(f"{'='*60}\n")
+
+            # Add to global run log even on error
+            _current_run_log["tool_calls"].append(call_log)
+
+            # Re-raise the exception so it can be handled upstream
+            raise
+
+    return wrapper
+
+
+def start_run_tracking(run_id: str = None, metadata: dict = None):
+    """
+    Start a new run tracking session.
+
+    Args:
+        run_id: Optional unique identifier for this run. Auto-generated if not provided.
+        metadata: Optional dictionary with additional context (e.g., {"dataset": "titanic.csv", "user": "analyst"})
+
+    Returns:
+        The run_id being used
+    """
+    global _current_run_log
+
+    if run_id is None:
+        run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    _current_run_log = {
+        "run_id": run_id,
+        "start_time": datetime.now().isoformat(),
+        "tool_calls": [],
+        "metadata": metadata or {}
+    }
+
+    print(f"\n{'🚀'*30}")
+    print(f"🎬 STARTING RUN TRACKING: {run_id}")
+    print(f"{'🚀'*30}\n")
+
+    return run_id
+
+
+def end_run_tracking(save_to_file: bool = True) -> dict:
+    """
+    End the current run tracking session and optionally save results.
+
+    Args:
+        save_to_file: If True, saves the run log to a JSON file in run_logs/ directory
+
+    Returns:
+        Dictionary containing the complete run log with statistics
+    """
+    global _current_run_log
+
+    _current_run_log["end_time"] = datetime.now().isoformat()
+
+    # Calculate summary statistics
+    total_calls = len(_current_run_log["tool_calls"])
+    successful_calls = sum(1 for call in _current_run_log["tool_calls"] if call["status"] == "success")
+    failed_calls = total_calls - successful_calls
+    total_time = sum(call.get("execution_time_seconds", 0) for call in _current_run_log["tool_calls"])
+
+    _current_run_log["summary"] = {
+        "total_tool_calls": total_calls,
+        "successful_calls": successful_calls,
+        "failed_calls": failed_calls,
+        "total_execution_time_seconds": round(total_time, 3),
+        "tools_used": list(set(call["tool_name"] for call in _current_run_log["tool_calls"])),
+        "success_rate": f"{(successful_calls/total_calls*100):.1f}%" if total_calls > 0 else "N/A"
+    }
+
+    # Print summary
+    print(f"\n{'🏁'*30}")
+    print(f"🎬 RUN COMPLETED: {_current_run_log['run_id']}")
+    print(f"📊 Summary:")
+    print(f"   Total tool calls: {total_calls}")
+    print(f"   Successful: {successful_calls}")
+    print(f"   Failed: {failed_calls}")
+    print(f"   Success rate: {_current_run_log['summary']['success_rate']}")
+    print(f"   Total time: {total_time:.3f}s")
+    print(f"   Tools used: {_current_run_log['summary']['tools_used']}")
+    print(f"{'🏁'*30}\n")
+
+    # Save to file if requested
+    if save_to_file:
+        log_dir = "run_logs"
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, f"{_current_run_log['run_id']}.json")
+
+        with open(log_file, 'w') as f:
+            json.dump(_current_run_log, f, indent=2)
+
+        print(f"💾 Run log saved to: {log_file}\n")
+
+    return _current_run_log.copy()
+
+
+def get_current_run_stats() -> dict:
+    """Get statistics for the current run without ending it."""
+    total_calls = len(_current_run_log["tool_calls"])
+    successful_calls = sum(1 for call in _current_run_log["tool_calls"] if call["status"] == "success")
+
+    return {
+        "run_id": _current_run_log.get("run_id"),
+        "total_calls": total_calls,
+        "successful_calls": successful_calls,
+        "failed_calls": total_calls - successful_calls,
+        "tools_used": list(set(call["tool_name"] for call in _current_run_log["tool_calls"]))
+    }
+
+
+# ============================================================================
+# DATA READING TOOLS
+# ============================================================================
+
+@tool
+def read_csv_file(file_path: str) -> str:
+    """
+    Loads a CSV file into a pandas DataFrame and extracts essential dataset metadata.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file. Must be a valid CSV format readable by pandas.
+
+    Returns:
+        Success message with dataset shape (rows × columns), complete list of column names, and total memory usage in KB. Returns error message if file cannot be loaded or parsed.
+    """
+    try:
+        df = pd.read_csv(file_path)
+
+        info = {
+            "status": "success",
+            "shape": df.shape,
+            "columns": list(df.columns),
+            "memory_usage": f"{df.memory_usage(deep=True).sum() / 1024:.2f} KB"
+        }
+
+        return f"CSV file loaded successfully. Shape: {info['shape']}, Columns: {info['columns']}"
+
+    except Exception as e:
+        return f"Error reading CSV file: {str(e)}"
+
+
+@tool
+def read_json_file(file_path: str) -> str:
+    """
+    Loads a JSON file and extracts structural information, handling both list and dictionary formats.
+
+    Args:
+        file_path: Absolute or relative path to the JSON file. File must contain valid JSON (array of objects, single object, or primitive types).
+
+    Returns:
+        For JSON arrays: shape and column names after DataFrame conversion. For JSON objects: list of top-level keys. For primitives: data type. Returns error message if file is invalid or unreadable.
+    """
+    try:
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+            return f"JSON file loaded successfully. Shape: {df.shape}, Columns: {list(df.columns)}"
+        elif isinstance(data, dict):
+            return f"JSON object loaded with keys: {list(data.keys())}"
+        else:
+            return f"JSON data loaded. Type: {type(data)}"
+
+    except Exception as e:
+        return f"Error reading JSON file: {str(e)}"
+
+
+@tool
+def get_column_info(file_path: str, column_name: Optional[str] = None) -> str:
+    """
+    Retrieves comprehensive profiling information for a specific column or all columns in the dataset.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file containing the dataset.
+        column_name: Name of the specific column to analyze in detail. If None, provides summary for all columns. Must exactly match a column name in the dataset.
+
+    Returns:
+        For single column: data type, null/non-null counts, unique value count, and statistics (mean/std/min/max/median for numeric; sample values for categorical). For all columns: concise summary of type and completeness for each. Returns error if column not found or file unreadable.
+    """
+    try:
+        df = pd.read_csv(file_path)
+
+        if column_name:
+            if column_name not in df.columns:
+                return f"Column '{column_name}' not found in dataset"
+
+            col = df[column_name]
+            info = {
+                "column": column_name,
+                "data_type": str(col.dtype),
+                "non_null_count": col.count(),
+                "null_count": col.isnull().sum(),
+                "unique_values": col.nunique(),
+            }
+
+            if col.dtype in ['int64', 'float64']:
+                info.update({
+                    "mean": col.mean(),
+                    "std": col.std(),
+                    "min": col.min(),
+                    "max": col.max(),
+                    "median": col.median()
+                })
+            elif col.dtype == 'object':
+                info["sample_values"] = col.dropna().unique()[:10].tolist()
+
+            return f"Column '{column_name}' info: {info}"
+        else:
+            # Return info for all columns
+            column_info = []
+            for col in df.columns:
+                col_data = df[col]
+                info = f"{col}: {col_data.dtype}, Non-null: {col_data.count()}/{len(df)}"
+                column_info.append(info)
+
+            return f"Dataset columns info:\n" + "\n".join(column_info)
+
+    except Exception as e:
+        return f"Error getting column info: {str(e)}"
+
+
+@tool
+def get_data_summary(file_path: str) -> str:
+    """
+    Generates a comprehensive statistical overview including shape, data types, missing values, and numeric summaries.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to analyze.
+
+    Returns:
+        Dictionary-formatted string with: total rows/columns, memory usage in KB, data type distribution, columns with missing values and their counts, and describe() statistics for all numeric columns. Returns error if file cannot be loaded.
+    """
+    try:
+        df = pd.read_csv(file_path)
+
+        # Get basic info
+        info = {
+            "total_rows": len(df),
+            "total_columns": len(df.columns),
+            "memory_usage": f"{df.memory_usage(deep=True).sum() / 1024:.2f} KB"
+        }
+
+        # Get data types summary
+        dtype_counts = df.dtypes.value_counts().to_dict()
+        info["data_types"] = {str(k): v for k, v in dtype_counts.items()}
+
+        # Get missing values summary
+        missing_counts = df.isnull().sum()
+        missing_info = missing_counts[missing_counts > 0].to_dict()
+        info["missing_values"] = missing_info
+
+        # Get numeric summary
+        numeric_cols = df.select_dtypes(include=['number']).columns
+        if len(numeric_cols) > 0:
+            info["numeric_summary"] = df[numeric_cols].describe().to_string()
+
+        return f"Data Summary: {info}"
+
+    except Exception as e:
+        return f"Error getting data summary: {str(e)}"
+
+
+@tool
+def preview_data(file_path: str, num_rows: int = 5) -> str:
+    """
+    Displays the first N rows of a dataset in tabular format for quick inspection.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to preview.
+        num_rows: Number of rows to display from the beginning of the dataset. Must be positive integer. Defaults to 5 if not specified.
+
+    Returns:
+        String-formatted table showing the first num_rows rows with all columns and their values. Returns error if file cannot be loaded or num_rows is invalid.
+    """
+    try:
+        df = pd.read_csv(file_path)
+
+        preview = df.head(num_rows).to_string()
+
+        return f"Data Preview (first {num_rows} rows):\n{preview}"
+
+    except Exception as e:
+        return f"Error previewing data: {str(e)}"
+
+
+# ============================================================================
+# DATA MANIPULATION TOOLS
+# ============================================================================
+
+@tool
+def handle_missing_values(file_path: str, column_name: str, method: str, fill_value: Optional[Union[str, float, int]] = None) -> str:
+    """
+    Imputes or removes missing values in a specified column using statistical or propagation-based methods.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to process.
+        column_name: Exact name of the column containing missing values to handle.
+        method: Imputation strategy. Options: 'drop' (remove rows), 'mean' (numeric only), 'median' (numeric only), 'mode' (most frequent), 'forward_fill' (propagate last valid), 'backward_fill' (propagate next valid), 'constant' (requires fill_value).
+        fill_value: Value to use when method='constant'. Must be compatible with column data type. Ignored for other methods.
+
+    Returns:
+        Success message with count of imputed values, remaining missing values, and path to saved output file (original filename + '_missing_handled.csv'). Returns error if column not found, method invalid, or data type mismatch.
+    """
+    try:
+        df = pd.read_csv(file_path)
+
+        if column_name not in df.columns:
+            return f"Column '{column_name}' not found in dataset"
+
+        missing_count_before = df[column_name].isnull().sum()
+
+        if missing_count_before == 0:
+            return f"No missing values found in column '{column_name}'"
+
+        if method == "drop":
+            df = df.dropna(subset=[column_name])
+        elif method == "mean":
+            if df[column_name].dtype in ['int64', 'float64']:
+                fill_val = df[column_name].mean()
+                df[column_name] = df[column_name].fillna(fill_val)
+            else:
+                return f"Mean method not applicable for non-numeric column '{column_name}'"
+        elif method == "median":
+            if df[column_name].dtype in ['int64', 'float64']:
+                fill_val = df[column_name].median()
+                df[column_name] = df[column_name].fillna(fill_val)
+            else:
+                return f"Median method not applicable for non-numeric column '{column_name}'"
+        elif method == "mode":
+            mode_val = df[column_name].mode()
+            if len(mode_val) > 0:
+                df[column_name] = df[column_name].fillna(mode_val[0])
+            else:
+                return f"No mode found for column '{column_name}'"
+        elif method == "forward_fill":
+            df[column_name] = df[column_name].fillna(method='ffill')
+        elif method == "backward_fill":
+            df[column_name] = df[column_name].fillna(method='bfill')
+        elif method == "constant" and fill_value is not None:
+            df[column_name] = df[column_name].fillna(fill_value)
+        else:
+            return f"Unknown method '{method}' or missing fill_value for constant method"
+
+        missing_count_after = df[column_name].isnull().sum()
+
+        # Save the modified dataframe
+        output_path = file_path.replace('.csv', '_missing_handled.csv')
+        df.to_csv(output_path, index=False)
+
+        return f"Handled {missing_count_before - missing_count_after} missing values in column '{column_name}' using method '{method}'. Remaining missing: {missing_count_after}. Saved to: {output_path}"
+
+    except Exception as e:
+        return f"Error handling missing values: {str(e)}"
+
+
+@tool
+def create_dummy_variables(file_path: str, column_name: str, prefix: Optional[str] = None) -> str:
+    """
+    Performs one-hot encoding on a categorical column, creating binary indicator columns for each unique value.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to process.
+        column_name: Exact name of the categorical column to encode. Works with both string and numeric categorical data.
+        prefix: Custom prefix for generated dummy column names. If None, uses the original column name. Generated columns follow format: '{prefix}_{value}'.
+
+    Returns:
+        Success message with count and list of created dummy columns, plus path to saved output file (original filename + '_with_dummies.csv'). The output file includes all original columns plus the new dummy variables. Returns error if column not found.
+    """
+    try:
+        df = pd.read_csv(file_path)
+
+        if column_name not in df.columns:
+            return f"Column '{column_name}' not found in dataset"
+
+        # Create dummy variables
+        dummies = pd.get_dummies(df[column_name], prefix=prefix or column_name)
+
+        # Add dummy variables to dataframe
+        df_with_dummies = pd.concat([df, dummies], axis=1)
+
+        # Save the modified dataframe
+        output_path = file_path.replace('.csv', '_with_dummies.csv')
+        df_with_dummies.to_csv(output_path, index=False)
+
+        return f"Created {len(dummies.columns)} dummy variables for '{column_name}': {list(dummies.columns)}. Saved to: {output_path}"
+
+    except Exception as e:
+        return f"Error creating dummy variables: {str(e)}"
+
+
+@tool
+def modify_column_values(file_path: str, column_name: str, operation: str, value: Optional[Union[str, float, int]] = None) -> str:
+    """
+    Applies arithmetic transformations, normalization, or value replacement to an entire column.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to process.
+        column_name: Exact name of the column to transform.
+        operation: Transformation type. Arithmetic (require value): 'multiply', 'add', 'subtract', 'divide'. Scaling (auto): 'normalize' (0-1 range via min-max), 'standardize' (z-score via mean-std). Replacement: 'replace' (value format: 'old_value,new_value').
+        value: Operand for arithmetic/replace operations. For 'replace': comma-separated string 'old,new'. For arithmetic: numeric scalar. Ignored for normalize/standardize.
+
+    Returns:
+        Success message with count of modified values and path to saved output file (original filename + '_modified.csv'). Returns error if column not found, operation invalid, or value format incorrect.
+    """
+    try:
+        df = pd.read_csv(file_path)
+
+        if column_name not in df.columns:
+            return f"Column '{column_name}' not found in dataset"
+
+        original_column = df[column_name].copy()
+
+        if operation == "multiply" and value is not None:
+            df[column_name] = df[column_name] * float(value)
+        elif operation == "add" and value is not None:
+            df[column_name] = df[column_name] + float(value)
+        elif operation == "subtract" and value is not None:
+            df[column_name] = df[column_name] - float(value)
+        elif operation == "divide" and value is not None:
+            df[column_name] = df[column_name] / float(value)
+        elif operation == "replace" and value is not None:
+            # For replace, value should be in format "old_value,new_value"
+            if isinstance(value, str) and "," in value:
+                old_val, new_val = value.split(",", 1)
+                df[column_name] = df[column_name].replace(old_val.strip(), new_val.strip())
+            else:
+                return "For replace operation, value should be in format 'old_value,new_value'"
+        elif operation == "normalize":
+            # Normalize to 0-1 range
+            min_val, max_val = df[column_name].min(), df[column_name].max()
+            df[column_name] = (df[column_name] - min_val) / (max_val - min_val)
+        elif operation == "standardize":
+            # Standardize to mean=0, std=1
+            mean_val, std_val = df[column_name].mean(), df[column_name].std()
+            df[column_name] = (df[column_name] - mean_val) / std_val
+        else:
+            return f"Unknown operation '{operation}' or missing value parameter"
+
+        # Save the modified dataframe
+        output_path = file_path.replace('.csv', '_modified.csv')
+        df.to_csv(output_path, index=False)
+
+        # Calculate changes
+        changed_count = (df[column_name] != original_column).sum()
+
+        return f"Modified {changed_count} values in column '{column_name}' using operation '{operation}'. Saved to: {output_path}"
+
+    except Exception as e:
+        return f"Error modifying column values: {str(e)}"
+
+
+@tool
+def convert_data_types(file_path: str, column_name: str, target_type: str) -> str:
+    """
+    Casts a column to a different data type with error handling for incompatible values.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to process.
+        column_name: Exact name of the column to cast.
+        target_type: Desired data type. Options: 'int' (nullable Int64), 'float' (float64), 'string' (object), 'category' (categorical dtype), 'datetime' (datetime64). Invalid values are coerced to NaN for numeric/datetime types.
+
+    Returns:
+        Success message showing original and new data types, plus path to saved output file (original filename + '_type_converted.csv'). Returns error if column not found or target_type invalid.
+    """
+    try:
+        df = pd.read_csv(file_path)
+
+        if column_name not in df.columns:
+            return f"Column '{column_name}' not found in dataset"
+
+        original_dtype = df[column_name].dtype
+
+        if target_type == "int":
+            df[column_name] = pd.to_numeric(df[column_name], errors='coerce').astype('Int64')
+        elif target_type == "float":
+            df[column_name] = pd.to_numeric(df[column_name], errors='coerce')
+        elif target_type == "string":
+            df[column_name] = df[column_name].astype(str)
+        elif target_type == "category":
+            df[column_name] = df[column_name].astype('category')
+        elif target_type == "datetime":
+            df[column_name] = pd.to_datetime(df[column_name], errors='coerce')
+        else:
+            return f"Unknown target type '{target_type}'. Supported types: int, float, string, category, datetime"
+
+        new_dtype = df[column_name].dtype
+
+        # Save the modified dataframe
+        output_path = file_path.replace('.csv', '_type_converted.csv')
+        df.to_csv(output_path, index=False)
+
+        return f"Converted column '{column_name}' from {original_dtype} to {new_dtype}. Saved to: {output_path}"
+
+    except Exception as e:
+        return f"Error converting data type: {str(e)}"
+
+
+# ============================================================================
+# DATA OPERATIONS TOOLS
+# ============================================================================
+
+@tool
+def filter_data(file_path: str, column_name: str, condition: str, value: Union[str, float, int]) -> str:
+    """
+    Filters dataset rows based on a comparison condition applied to a specified column.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to filter.
+        column_name: Exact name of the column to apply the filter condition on.
+        condition: Comparison operator. Options: 'equals', 'not_equals', 'greater_than', 'less_than', 'greater_equal', 'less_equal' (numeric comparison), 'contains' (substring match for strings).
+        value: Threshold or target value for comparison. Type should match column data type (numeric for comparison operators, string for 'contains').
+
+    Returns:
+        Success message with original and filtered row counts, applied condition description, and path to saved output file (original filename + '_filtered.csv'). Returns error if column not found or condition invalid.
+    """
+    try:
+        df = pd.read_csv(file_path)
+
+        if column_name not in df.columns:
+            return f"Column '{column_name}' not found in dataset"
+
+        original_rows = len(df)
+
+        if condition == "equals":
+            filtered_df = df[df[column_name] == value]
+        elif condition == "not_equals":
+            filtered_df = df[df[column_name] != value]
+        elif condition == "greater_than":
+            filtered_df = df[df[column_name] > float(value)]
+        elif condition == "less_than":
+            filtered_df = df[df[column_name] < float(value)]
+        elif condition == "greater_equal":
+            filtered_df = df[df[column_name] >= float(value)]
+        elif condition == "less_equal":
+            filtered_df = df[df[column_name] <= float(value)]
+        elif condition == "contains":
+            filtered_df = df[df[column_name].astype(str).str.contains(str(value), na=False)]
+        else:
+            return f"Unknown condition '{condition}'"
+
+        filtered_rows = len(filtered_df)
+
+        # Save the filtered dataframe
+        output_path = file_path.replace('.csv', '_filtered.csv')
+        filtered_df.to_csv(output_path, index=False)
+
+        return f"Filtered data: {original_rows} -> {filtered_rows} rows using condition '{column_name} {condition} {value}'. Saved to: {output_path}"
+
+    except Exception as e:
+        return f"Error filtering data: {str(e)}"
+
+
+@tool
+def perform_math_operations(file_path: str, operation: str, column1: str, column2: Optional[str] = None, value: Optional[float] = None) -> str:
+    """
+    Creates a new column by applying arithmetic or mathematical functions to one or two existing columns.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to process.
+        operation: Mathematical operation. Binary (require column2 OR value): 'add', 'subtract', 'multiply', 'divide'. Unary: 'square', 'sqrt', 'log', 'abs'. Special: 'power' (requires value as exponent).
+        column1: Name of the primary column for the operation. Must contain numeric data.
+        column2: Name of the second column for binary operations (column1 op column2). Mutually exclusive with value.
+        value: Numeric scalar for binary operations (column1 op value) or exponent for 'power'. Mutually exclusive with column2.
+
+    Returns:
+        Success message with new column name (auto-generated as '{column1}_{operation}_{column2/value}') and path to saved output file (original filename + '_math_ops.csv'). Returns error if columns not found, operation invalid, or parameters missing.
+    """
+    try:
+        df = pd.read_csv(file_path)
+
+        if column1 not in df.columns:
+            return f"Column '{column1}' not found in dataset"
+
+        if column2 and column2 not in df.columns:
+            return f"Column '{column2}' not found in dataset"
+
+        # Create new column name for result
+        if column2:
+            new_col_name = f"{column1}_{operation}_{column2}"
+        elif value is not None:
+            new_col_name = f"{column1}_{operation}_{value}"
+        else:
+            new_col_name = f"{column1}_{operation}"
+
+        # Perform operations
+        if operation == "add":
+            if column2:
+                df[new_col_name] = df[column1] + df[column2]
+            elif value is not None:
+                df[new_col_name] = df[column1] + value
+        elif operation == "subtract":
+            if column2:
+                df[new_col_name] = df[column1] - df[column2]
+            elif value is not None:
+                df[new_col_name] = df[column1] - value
+        elif operation == "multiply":
+            if column2:
+                df[new_col_name] = df[column1] * df[column2]
+            elif value is not None:
+                df[new_col_name] = df[column1] * value
+        elif operation == "divide":
+            if column2:
+                df[new_col_name] = df[column1] / df[column2]
+            elif value is not None:
+                df[new_col_name] = df[column1] / value
+        elif operation == "power":
+            if value is not None:
+                df[new_col_name] = df[column1] ** value
+            else:
+                return "Power operation requires a value parameter"
+        elif operation == "square":
+            df[new_col_name] = df[column1] ** 2
+        elif operation == "sqrt":
+            df[new_col_name] = np.sqrt(df[column1])
+        elif operation == "log":
+            df[new_col_name] = np.log(df[column1])
+        elif operation == "abs":
+            df[new_col_name] = np.abs(df[column1])
+        else:
+            return f"Unknown operation '{operation}'"
+
+        # Save the modified dataframe
+        output_path = file_path.replace('.csv', '_math_ops.csv')
+        df.to_csv(output_path, index=False)
+
+        return f"Created new column '{new_col_name}' using operation '{operation}'. Saved to: {output_path}"
+
+    except Exception as e:
+        return f"Error performing math operation: {str(e)}"
+
+
+@tool
+def aggregate_data(file_path: str, group_by_columns: str, agg_column: str, agg_function: str) -> str:
+    """
+    Groups dataset by specified columns and computes aggregate statistics for a target column.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to aggregate.
+        group_by_columns: Comma-separated list of column names to group by (e.g., 'Category,Region'). Whitespace around commas is trimmed.
+        agg_column: Name of the column to compute aggregates on. Must be numeric for most functions except 'count'.
+        agg_function: Aggregation method. Options: 'mean', 'sum', 'count', 'min', 'max', 'std', 'median'. Result column named '{agg_column}_{agg_function}'.
+
+    Returns:
+        Success message with group-by columns, aggregation function, result shape, full result table, and path to saved output file (original filename + '_aggregated.csv'). Returns error if columns not found or function invalid.
+    """
+    try:
+        df = pd.read_csv(file_path)
+
+        # Parse group by columns
+        group_cols = [col.strip() for col in group_by_columns.split(',')]
+
+        # Check if columns exist
+        for col in group_cols + [agg_column]:
+            if col not in df.columns:
+                return f"Column '{col}' not found in dataset"
+
+        # Perform aggregation
+        if agg_function == "mean":
+            result_df = df.groupby(group_cols)[agg_column].mean().reset_index()
+        elif agg_function == "sum":
+            result_df = df.groupby(group_cols)[agg_column].sum().reset_index()
+        elif agg_function == "count":
+            result_df = df.groupby(group_cols)[agg_column].count().reset_index()
+        elif agg_function == "min":
+            result_df = df.groupby(group_cols)[agg_column].min().reset_index()
+        elif agg_function == "max":
+            result_df = df.groupby(group_cols)[agg_column].max().reset_index()
+        elif agg_function == "std":
+            result_df = df.groupby(group_cols)[agg_column].std().reset_index()
+        elif agg_function == "median":
+            result_df = df.groupby(group_cols)[agg_column].median().reset_index()
+        else:
+            return f"Unknown aggregation function '{agg_function}'"
+
+        # Rename the aggregated column
+        result_df = result_df.rename(columns={agg_column: f"{agg_column}_{agg_function}"})
+
+        # Save the aggregated dataframe
+        output_path = file_path.replace('.csv', '_aggregated.csv')
+        result_df.to_csv(output_path, index=False)
+
+        return f"Aggregated data by {group_cols} using {agg_function} on '{agg_column}'. Result shape: {result_df.shape}. Result:\n{result_df.to_string()}\nSaved to: {output_path}"
+
+    except Exception as e:
+        return f"Error aggregating data: {str(e)}"
+
+
+@tool
+def string_operations(file_path: str, column_name: str, operation: str, parameter: Optional[str] = None) -> str:
+    """
+    Applies text transformation operations to a string column, creating new derived columns.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to process.
+        column_name: Name of the text column to transform. Column is cast to string type if necessary.
+        operation: Text transformation type. Simple: 'upper', 'lower', 'title', 'length', 'strip'. With parameter: 'contains_count' (occurrences of substring), 'split' (create multiple columns), 'replace' (parameter format: 'old,new').
+        parameter: Required for: 'contains_count' (substring to count), 'split' (delimiter), 'replace' (comma-separated 'old,new'). Ignored for simple operations.
+
+    Returns:
+        Success message with operation type, original column name, new column name(s), and path to saved output file (original filename + '_string_ops.csv'). Returns error if column not found, operation invalid, or parameter missing/malformed.
+    """
+    try:
+        df = pd.read_csv(file_path)
+
+        if column_name not in df.columns:
+            return f"Column '{column_name}' not found in dataset"
+
+        # Convert to string type
+        df[column_name] = df[column_name].astype(str)
+
+        if operation == "upper":
+            new_col_name = f"{column_name}_upper"
+            df[new_col_name] = df[column_name].str.upper()
+        elif operation == "lower":
+            new_col_name = f"{column_name}_lower"
+            df[new_col_name] = df[column_name].str.lower()
+        elif operation == "title":
+            new_col_name = f"{column_name}_title"
+            df[new_col_name] = df[column_name].str.title()
+        elif operation == "length":
+            new_col_name = f"{column_name}_length"
+            df[new_col_name] = df[column_name].str.len()
+        elif operation == "contains_count" and parameter:
+            new_col_name = f"{column_name}_contains_{parameter}"
+            df[new_col_name] = df[column_name].str.count(parameter)
+        elif operation == "split" and parameter:
+            # Split and create new columns
+            split_cols = df[column_name].str.split(parameter, expand=True)
+            for i, col in enumerate(split_cols.columns):
+                df[f"{column_name}_part_{i+1}"] = split_cols[col]
+            new_col_name = f"split into {len(split_cols.columns)} columns"
+        elif operation == "replace" and parameter:
+            # Parameter should be "old,new"
+            if "," in parameter:
+                old, new = parameter.split(",", 1)
+                new_col_name = f"{column_name}_replaced"
+                df[new_col_name] = df[column_name].str.replace(old.strip(), new.strip())
+            else:
+                return "Replace operation requires parameter in format 'old,new'"
+        elif operation == "strip":
+            new_col_name = f"{column_name}_stripped"
+            df[new_col_name] = df[column_name].str.strip()
+        else:
+            return f"Unknown string operation '{operation}'"
+
+        # Save the modified dataframe
+        output_path = file_path.replace('.csv', '_string_ops.csv')
+        df.to_csv(output_path, index=False)
+
+        return f"Applied string operation '{operation}' to column '{column_name}'. Result: {new_col_name}. Saved to: {output_path}"
+
+    except Exception as e:
+        return f"Error performing string operation: {str(e)}"
+
+
+# ============================================================================
+# MACHINE LEARNING TOOLS
+# ============================================================================
+
+@tool
+def train_regression_model(file_path: str, target_column: str, feature_columns: str, model_type: str = "linear") -> str:
+    """
+    Trains a regression model with train/test split, evaluates performance metrics, and saves the trained model.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file containing training data.
+        target_column: Name of the continuous target variable column to predict.
+        feature_columns: Comma-separated list of feature column names (e.g., 'Age,Income,Score'). Categorical features are automatically label-encoded. Missing values are imputed with mean.
+        model_type: Regression algorithm. Options: 'linear' (LinearRegression), 'random_forest' (RandomForestRegressor with 100 trees). Defaults to 'linear'.
+
+    Returns:
+        Dictionary-formatted string with: model type, features/target, train/test sizes, MSE, RMSE, R² score, 5-fold cross-validation R² (mean±std), and path to saved model file (original filename + '_{model_type}_regression_model.joblib'). Returns error if columns not found or model_type invalid.
+    """
+    try:
+        df = pd.read_csv(file_path)
+
+        # Parse feature columns
+        features = [col.strip() for col in feature_columns.split(',')]
+
+        # Check if columns exist
+        for col in features + [target_column]:
+            if col not in df.columns:
+                return f"Column '{col}' not found in dataset"
+
+        # Prepare data
+        X = df[features]
+        y = df[target_column]
+
+        # Handle missing values
+        X = X.fillna(X.mean())
+        y = y.fillna(y.mean())
+
+        # Handle categorical variables in features
+        for col in X.columns:
+            if X[col].dtype == 'object':
+                le = LabelEncoder()
+                X[col] = le.fit_transform(X[col].astype(str))
+
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        # Train model
+        if model_type == "linear":
+            model = LinearRegression()
+        elif model_type == "random_forest":
+            model = RandomForestRegressor(n_estimators=100, random_state=42)
+        else:
+            return f"Unknown regression model type '{model_type}'"
+
+        model.fit(X_train, y_train)
+
+        # Make predictions
+        y_pred = model.predict(X_test)
+
+        # Calculate metrics
+        mse = mean_squared_error(y_test, y_pred)
+        r2 = r2_score(y_test, y_pred)
+        rmse = np.sqrt(mse)
+
+        # Cross-validation
+        cv_scores = cross_val_score(model, X, y, cv=5, scoring='r2')
+
+        # Save model
+        model_path = file_path.replace('.csv', f'_{model_type}_regression_model.joblib')
+        joblib.dump(model, model_path)
+
+        results = {
+            "model_type": f"{model_type} regression",
+            "features": features,
+            "target": target_column,
+            "train_size": len(X_train),
+            "test_size": len(X_test),
+            "mse": round(mse, 4),
+            "rmse": round(rmse, 4),
+            "r2_score": round(r2, 4),
+            "cv_r2_mean": round(cv_scores.mean(), 4),
+            "cv_r2_std": round(cv_scores.std(), 4),
+            "model_saved": model_path
+        }
+
+        return f"Regression model trained: {results}"
+
+    except Exception as e:
+        return f"Error training regression model: {str(e)}"
+
+
+# @tool
+# def train_svm_model(file_path: str, target_column: str, feature_columns: str, task_type: str = "classification") -> str:
+#     """
+#     Train a Support Vector Machine model.
+
+#     Args:
+#         file_path: Path to the data file
+#         target_column: Name of the target variable column
+#         feature_columns: Comma-separated list of feature columns
+#         task_type: Type of task (classification, regression)
+
+#     Returns:
+#         String describing the model training results
+#     """
+#     try:
+#         df = pd.read_csv(file_path)
+
+#         # Parse feature columns
+#         features = [col.strip() for col in feature_columns.split(',')]
+
+#         # Check if columns exist
+#         for col in features + [target_column]:
+#             if col not in df.columns:
+#                 return f"Column '{col}' not found in dataset"
+
+#         # Prepare data
+#         X = df[features]
+#         y = df[target_column]
+
+#         # Handle missing values
+#         X = X.fillna(X.mean())
+#         if task_type == "classification":
+#             y = y.fillna(y.mode()[0])
+#         else:
+#             y = y.fillna(y.mean())
+
+#         # Handle categorical variables
+#         for col in X.columns:
+#             if X[col].dtype == 'object':
+#                 le = LabelEncoder()
+#                 X[col] = le.fit_transform(X[col].astype(str))
+
+#         if task_type == "classification" and y.dtype == 'object':
+#             le_target = LabelEncoder()
+#             y = le_target.fit_transform(y.astype(str))
+
+#         # Split data
+#         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+#         # Train model
+#         if task_type == "classification":
+#             model = SVC(kernel='rbf', random_state=42)
+#             scoring_metric = 'accuracy'
+#         else:
+#             model = SVR(kernel='rbf')
+#             scoring_metric = 'r2'
+
+#         model.fit(X_train, y_train)
+
+#         # Make predictions
+#         y_pred = model.predict(X_test)
+
+#         # Calculate metrics
+#         if task_type == "classification":
+#             accuracy = accuracy_score(y_test, y_pred)
+#             precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+#             recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+#             f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+
+#             metrics = {
+#                 "accuracy": round(accuracy, 4),
+#                 "precision": round(precision, 4),
+#                 "recall": round(recall, 4),
+#                 "f1_score": round(f1, 4)
+#             }
+#         else:
+#             mse = mean_squared_error(y_test, y_pred)
+#             r2 = r2_score(y_test, y_pred)
+
+#             metrics = {
+#                 "mse": round(mse, 4),
+#                 "r2_score": round(r2, 4)
+#             }
+
+#         # Cross-validation
+#         cv_scores = cross_val_score(model, X, y, cv=5, scoring=scoring_metric)
+
+#         # Save model
+#         model_path = file_path.replace('.csv', f'_svm_{task_type}_model.joblib')
+#         joblib.dump(model, model_path)
+
+#         results = {
+#             "model_type": f"SVM {task_type}",
+#             "features": features,
+#             "target": target_column,
+#             "train_size": len(X_train),
+#             "test_size": len(X_test),
+#             metrics,
+#             "cv_score_mean": round(cv_scores.mean(), 4),
+#             "cv_score_std": round(cv_scores.std(), 4),
+#             "model_saved": model_path
+#         }
+
+#         return f"SVM model trained: {results}"
+
+#     except Exception as e:
+#         return f"Error training SVM model: {str(e)}"
+
+
+# @tool
+# def train_random_forest_model(file_path: str, target_column: str, feature_columns: str, task_type: str = "classification") -> str:
+#     """
+#     Train a Random Forest model.
+
+#     Args:
+#         file_path: Path to the data file
+#         target_column: Name of the target variable column
+#         feature_columns: Comma-separated list of feature columns
+#         task_type: Type of task (classification, regression)
+
+#     Returns:
+#         String describing the model training results including feature importance
+#     """
+#     try:
+#         df = pd.read_csv(file_path)
+
+#         # Parse feature columns
+#         features = [col.strip() for col in feature_columns.split(',')]
+
+#         # Check if columns exist
+#         for col in features + [target_column]:
+#             if col not in df.columns:
+#                 return f"Column '{col}' not found in dataset"
+
+#         # Prepare data
+#         X = df[features]
+#         y = df[target_column]
+
+#         # Handle missing values
+#         X = X.fillna(X.mean())
+#         if task_type == "classification":
+#             y = y.fillna(y.mode()[0])
+#         else:
+#             y = y.fillna(y.mean())
+
+#         # Handle categorical variables
+#         for col in X.columns:
+#             if X[col].dtype == 'object':
+#                 le = LabelEncoder()
+#                 X[col] = le.fit_transform(X[col].astype(str))
+
+#         if task_type == "classification" and y.dtype == 'object':
+#             le_target = LabelEncoder()
+#             y = le_target.fit_transform(y.astype(str))
+
+#         # Split data
+#         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+#         # Train model
+#         if task_type == "classification":
+#             model = RandomForestClassifier(n_estimators=100, random_state=42)
+#             scoring_metric = 'accuracy'
+#         else:
+#             model = RandomForestRegressor(n_estimators=100, random_state=42)
+#             scoring_metric = 'r2'
+
+#         model.fit(X_train, y_train)
+
+#         # Make predictions
+#         y_pred = model.predict(X_test)
+
+#         # Calculate metrics
+#         if task_type == "classification":
+#             accuracy = accuracy_score(y_test, y_pred)
+#             precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+#             recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+#             f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+
+#             metrics = {
+#                 "accuracy": round(accuracy, 4),
+#                 "precision": round(precision, 4),
+#                 "recall": round(recall, 4),
+#                 "f1_score": round(f1, 4)
+#             }
+#         else:
+#             mse = mean_squared_error(y_test, y_pred)
+#             r2 = r2_score(y_test, y_pred)
+
+#             metrics = {
+#                 "mse": round(mse, 4),
+#                 "r2_score": round(r2, 4)
+#             }
+
+#         # Feature importance
+#         feature_importance = dict(zip(features, [round(imp, 4) for imp in model.feature_importances_]))
+
+#         # Cross-validation
+#         cv_scores = cross_val_score(model, X, y, cv=5, scoring=scoring_metric)
+
+#         # Save model
+#         model_path = file_path.replace('.csv', f'_rf_{task_type}_model.joblib')
+#         joblib.dump(model, model_path)
+
+#         results = {
+#             "model_type": f"Random Forest {task_type}",
+#             "features": features,
+#             "target": target_column,
+#             "train_size": len(X_train),
+#             "test_size": len(X_test),
+#             metrics,
+#             "cv_score_mean": round(cv_scores.mean(), 4),
+#             "cv_score_std": round(cv_scores.std(), 4),
+#             "feature_importance": feature_importance,
+#             "model_saved": model_path
+#         }
+
+#         return f"Random Forest model trained: {results}"
+
+#     except Exception as e:
+#         return f"Error training Random Forest model: {str(e)}"
+
+
+# @tool
+# def train_knn_model(file_path: str, target_column: str, feature_columns: str, task_type: str = "classification", n_neighbors: int = 5) -> str:
+#     """
+#     Train a K-Nearest Neighbors model.
+
+#     Args:
+#         file_path: Path to the data file
+#         target_column: Name of the target variable column
+#         feature_columns: Comma-separated list of feature columns
+#         task_type: Type of task (classification, regression)
+#         n_neighbors: Number of neighbors to use
+
+#     Returns:
+#         String describing the model training results
+#     """
+#     try:
+#         df = pd.read_csv(file_path)
+
+#         # Parse feature columns
+#         features = [col.strip() for col in feature_columns.split(',')]
+
+#         # Check if columns exist
+#         for col in features + [target_column]:
+#             if col not in df.columns:
+#                 return f"Column '{col}' not found in dataset"
+
+#         # Prepare data
+#         X = df[features]
+#         y = df[target_column]
+
+#         # Handle missing values
+#         X = X.fillna(X.mean())
+#         if task_type == "classification":
+#             y = y.fillna(y.mode()[0])
+#         else:
+#             y = y.fillna(y.mean())
+
+#         # Handle categorical variables
+#         for col in X.columns:
+#             if X[col].dtype == 'object':
+#                 le = LabelEncoder()
+#                 X[col] = le.fit_transform(X[col].astype(str))
+
+#         if task_type == "classification" and y.dtype == 'object':
+#             le_target = LabelEncoder()
+#             y = le_target.fit_transform(y.astype(str))
+
+#         # Split data
+#         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+#         # Train model
+#         if task_type == "classification":
+#             model = KNeighborsClassifier(n_neighbors=n_neighbors)
+#             scoring_metric = 'accuracy'
+#         else:
+#             model = KNeighborsRegressor(n_neighbors=n_neighbors)
+#             scoring_metric = 'r2'
+
+#         model.fit(X_train, y_train)
+
+#         # Make predictions
+#         y_pred = model.predict(X_test)
+
+#         # Calculate metrics
+#         if task_type == "classification":
+#             accuracy = accuracy_score(y_test, y_pred)
+#             precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+#             recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+#             f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+
+#             metrics = {
+#                 "accuracy": round(accuracy, 4),
+#                 "precision": round(precision, 4),
+#                 "recall": round(recall, 4),
+#                 "f1_score": round(f1, 4)
+#             }
+#         else:
+#             mse = mean_squared_error(y_test, y_pred)
+#             r2 = r2_score(y_test, y_pred)
+
+#             metrics = {
+#                 "mse": round(mse, 4),
+#                 "r2_score": round(r2, 4)
+#             }
+
+#         # Cross-validation
+#         cv_scores = cross_val_score(model, X, y, cv=5, scoring=scoring_metric)
+
+#         # Save model
+#         model_path = file_path.replace('.csv', f'_knn_{task_type}_model.joblib')
+#         joblib.dump(model, model_path)
+
+#         results = {
+#             "model_type": f"KNN {task_type}",
+#             "n_neighbors": n_neighbors,
+#             "features": features,
+#             "target": target_column,
+#             "train_size": len(X_train),
+#             "test_size": len(X_test),
+#             metrics,
+#             "cv_score_mean": round(cv_scores.mean(), 4),
+#             "cv_score_std": round(cv_scores.std(), 4),
+#             "model_saved": model_path
+#         }
+
+#         return f"KNN model trained: {results}"
+
+#     except Exception as e:
+#         return f"Error training KNN model: {str(e)}"
+
+
+# @tool
+# def evaluate_model(model_path: str, test_data_path: str, target_column: str, feature_columns: str) -> str:
+#     """
+#     Evaluate a trained model on new test data.
+
+#     Args:
+#         model_path: Path to the saved model file
+#         test_data_path: Path to the test data file
+#         target_column: Name of the target variable column
+#         feature_columns: Comma-separated list of feature columns
+
+#     Returns:
+#         String describing the model evaluation results
+#     """
+#     try:
+#         # Load the model
+#         model = joblib.load(model_path)
+
+#         # Load test data
+#         df = pd.read_csv(test_data_path)
+
+#         # Parse feature columns
+#         features = [col.strip() for col in feature_columns.split(',')]
+
+#         # Check if columns exist
+#         for col in features + [target_column]:
+#             if col not in df.columns:
+#                 return f"Column '{col}' not found in test dataset"
+
+#         # Prepare test data
+#         X = df[features]
+#         y = df[target_column]
+
+#         # Handle missing values
+#         X = X.fillna(X.mean())
+
+#         # Handle categorical variables (same as training)
+#         for col in X.columns:
+#             if X[col].dtype == 'object':
+#                 le = LabelEncoder()
+#                 X[col] = le.fit_transform(X[col].astype(str))
+
+#         # Make predictions
+#         y_pred = model.predict(X)
+
+#         # Determine if this is classification or regression based on model type
+#         model_name = str(type(model).__name__)
+#         is_classification = any(clf in model_name for clf in ['Classifier', 'SVC'])
+
+#         # Calculate appropriate metrics
+#         if is_classification:
+#             accuracy = accuracy_score(y, y_pred)
+#             precision = precision_score(y, y_pred, average='weighted', zero_division=0)
+#             recall = recall_score(y, y_pred, average='weighted', zero_division=0)
+#             f1 = f1_score(y, y_pred, average='weighted', zero_division=0)
+
+#             results = {
+#                 "model_type": model_name,
+#                 "task": "classification",
+#                 "test_samples": len(X),
+#                 "accuracy": round(accuracy, 4),
+#                 "precision": round(precision, 4),
+#                 "recall": round(recall, 4),
+#                 "f1_score": round(f1, 4)
+#             }
+#         else:
+#             mse = mean_squared_error(y, y_pred)
+#             r2 = r2_score(y, y_pred)
+#             rmse = np.sqrt(mse)
+
+#             results = {
+#                 "model_type": model_name,
+#                 "task": "regression",
+#                 "test_samples": len(X),
+#                 "mse": round(mse, 4),
+#                 "rmse": round(rmse, 4),
+#                 "r2_score": round(r2, 4)
+#             }
+
+#         return f"Model evaluation results: {results}"
+
+#     except Exception as e:
+#         return f"Error evaluating model: {str(e)}"
+    
+# ============================================================================
+# DATA READING TOOLS - Simplified and Specific
+# ============================================================================
+
+@tool
+def load_dataset(file_path: str) -> str:
+    """
+    Loads a CSV dataset and reports its dimensionality as a quick validation check.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to load.
+
+    Returns:
+        Success message with dataset dimensions in format 'N rows, M columns'. Returns error if file cannot be loaded or is not valid CSV.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        return f"Dataset loaded: {df.shape[0]} rows, {df.shape[1]} columns"
+    except Exception as e:
+        return f"Error loading dataset: {str(e)}"
+
+
+@tool
+def get_column_names(file_path: str) -> str:
+    """
+    Extracts and lists all column headers from a CSV dataset in order.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file.
+
+    Returns:
+        Comma-separated string of all column names in original order. Returns error if file cannot be loaded.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        return f"Columns: {', '.join(df.columns.tolist())}"
+    except Exception as e:
+        return f"Error getting columns: {str(e)}"
+
+
+@tool
+def get_data_types(file_path: str) -> str:
+    """
+    Identifies and reports the pandas data type (dtype) for each column in the dataset.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to analyze.
+
+    Returns:
+        Multi-line string listing each column name with its pandas dtype (e.g., int64, float64, object, datetime64). Returns error if file cannot be loaded.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        dtypes = df.dtypes.to_dict()
+        result = []
+        for col, dtype in dtypes.items():
+            result.append(f"{col}: {dtype}")
+        return "Data types:\n" + "\n".join(result)
+    except Exception as e:
+        return f"Error getting data types: {str(e)}"
+
+
+@tool
+def get_null_counts(file_path: str) -> str:
+    """
+    Quantifies missing (NaN/None) values across all columns with both absolute counts and percentages.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to analyze.
+
+    Returns:
+        Multi-line string showing each column with missing values, their count, and percentage of total rows (e.g., 'Age: 177 (19.9%)'). Returns 'No missing values found' if dataset is complete. Returns error if file cannot be loaded.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        null_counts = df.isnull().sum()
+        result = []
+        for col, count in null_counts.items():
+            if count > 0:
+                pct = (count / len(df)) * 100
+                result.append(f"{col}: {count} ({pct:.1f}%)")
+        
+        if result:
+            return "Missing values:\n" + "\n".join(result)
+        else:
+            return "No missing values found"
+    except Exception as e:
+        return f"Error counting nulls: {str(e)}"
+
+
+@tool
+def get_unique_values(file_path: str, column_name: str) -> str:
+    """
+    Identifies all distinct values in a column, useful for understanding cardinality and categorical distributions.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file.
+        column_name: Exact name of the column to analyze. Must exist in dataset.
+
+    Returns:
+        For low cardinality (≤20 unique values): full list of all unique values. For high cardinality (>20): count plus first 10 sample values. Excludes NaN values. Returns error if column not found or file unreadable.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        if column_name not in df.columns:
+            return f"Column '{column_name}' not found"
+        
+        unique_vals = df[column_name].dropna().unique()
+        n_unique = len(unique_vals)
+        
+        if n_unique <= 20:
+            return f"Column '{column_name}' has {n_unique} unique values: {', '.join(map(str, unique_vals))}"
+        else:
+            sample = unique_vals[:10]
+            return f"Column '{column_name}' has {n_unique} unique values. First 10: {', '.join(map(str, sample))}"
+    except Exception as e:
+        return f"Error getting unique values: {str(e)}"
+
+
+@tool
+def get_numeric_summary(file_path: str, column_name: str) -> str:
+    """
+    Computes comprehensive descriptive statistics for a numeric column including central tendency and distribution measures.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file.
+        column_name: Exact name of the numeric column to summarize. Must contain numeric data (int/float).
+
+    Returns:
+        Multi-line formatted string with: count (non-null), mean, median, standard deviation, min, 25th/50th/75th percentiles, and max. All values rounded to 2 decimal places. Excludes NaN values from calculations. Returns error if column not found, non-numeric, or file unreadable.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        if column_name not in df.columns:
+            return f"Column '{column_name}' not found"
+        
+        col = df[column_name].dropna()
+        
+        stats = {
+            "count": len(col),
+            "mean": col.mean(),
+            "median": col.median(),
+            "std": col.std(),
+            "min": col.min(),
+            "25%": col.quantile(0.25),
+            "50%": col.quantile(0.50),
+            "75%": col.quantile(0.75),
+            "max": col.max()
+        }
+        
+        result = f"Statistics for '{column_name}':\n"
+        for key, val in stats.items():
+            result += f"  {key}: {val:.2f}\n"
+        
+        return result
+    except Exception as e:
+        return f"Error getting summary: {str(e)}"
+
+
+@tool
+def get_first_rows(file_path: str, n_rows: int = 5) -> str:
+    """
+    Displays the first N rows of a dataset in tabular format for quick data inspection and schema understanding.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file.
+        n_rows: Number of rows to display from the beginning. Must be positive integer. Defaults to 5.
+
+    Returns:
+        String-formatted table showing first n_rows with all columns and their values, including index. Returns error if file cannot be loaded or n_rows invalid.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        preview = df.head(n_rows).to_string()
+        return f"First {n_rows} rows:\n{preview}"
+    except Exception as e:
+        return f"Error getting rows: {str(e)}"
+
+
+# ============================================================================
+# DATA MANIPULATION TOOLS - More Specific
+# ============================================================================
+
+@tool
+def drop_column(file_path: str, column_name: str) -> str:
+    """
+    Removes a specified column from the dataset, useful for eliminating irrelevant or redundant features.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to modify.
+        column_name: Exact name of the column to remove. Must exist in dataset.
+
+    Returns:
+        Success message with new dataset shape and path to saved output file (original filename + '_dropped.csv'). Returns error if column not found or file unreadable.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        if column_name not in df.columns:
+            return f"Column '{column_name}' not found"
+        
+        df = df.drop(columns=[column_name])
+        output_path = file_path.replace('.csv', '_dropped.csv')
+        df.to_csv(output_path, index=False)
+        
+        return f"Dropped column '{column_name}'. New shape: {df.shape}. Saved to: {output_path}"
+    except Exception as e:
+        return f"Error dropping column: {str(e)}"
+
+
+@tool
+def drop_null_rows(file_path: str, column_name: Optional[str] = None) -> str:
+    """
+    Removes rows containing missing values, either globally or in a specific column.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to clean.
+        column_name: If specified, removes only rows with NaN in this column. If None, removes any row with NaN in any column. Must be valid column name if provided.
+
+    Returns:
+        Success message with count of dropped rows, new dataset shape, and path to saved output file (original filename + '_no_nulls.csv'). Returns error if column not found (when specified) or file unreadable.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        original_len = len(df)
+        
+        if column_name:
+            if column_name not in df.columns:
+                return f"Column '{column_name}' not found"
+            df = df.dropna(subset=[column_name])
+        else:
+            df = df.dropna()
+        
+        dropped = original_len - len(df)
+        output_path = file_path.replace('.csv', '_no_nulls.csv')
+        df.to_csv(output_path, index=False)
+        
+        return f"Dropped {dropped} rows with nulls. New shape: {df.shape}. Saved to: {output_path}"
+    except Exception as e:
+        return f"Error dropping null rows: {str(e)}"
+
+
+@tool
+def fill_numeric_nulls(file_path: str, column_name: str, method: str = "mean") -> str:
+    """
+    Imputes missing values in a numeric column using statistical measures or custom values.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to process.
+        column_name: Exact name of the numeric column to impute. Must contain numeric data.
+        method: Imputation strategy. Options: 'mean' (column average), 'median' (column median), 'zero' (fill with 0), or any numeric string (custom value). Defaults to 'mean'.
+
+    Returns:
+        Success message with count of imputed NaNs, method used, fill value (rounded to 2 decimals), and path to saved output file (original filename + '_filled.csv'). Returns 'No missing values' if column is complete. Returns error if column not found, non-numeric, or method invalid.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        if column_name not in df.columns:
+            return f"Column '{column_name}' not found"
+        
+        null_count = df[column_name].isnull().sum()
+        if null_count == 0:
+            return f"No missing values in '{column_name}'"
+        
+        if method == "mean":
+            fill_value = df[column_name].mean()
+        elif method == "median":
+            fill_value = df[column_name].median()
+        elif method == "zero":
+            fill_value = 0
+        else:
+            try:
+                fill_value = float(method)
+            except:
+                return f"Invalid method: {method}"
+        
+        df[column_name] = df[column_name].fillna(fill_value)
+        
+        output_path = file_path.replace('.csv', '_filled.csv')
+        df.to_csv(output_path, index=False)
+        
+        return f"Filled {null_count} nulls in '{column_name}' with {method} ({fill_value:.2f}). Saved to: {output_path}"
+    except Exception as e:
+        return f"Error filling nulls: {str(e)}"
+
+
+@tool
+def fill_categorical_nulls(file_path: str, column_name: str, method: str = "mode") -> str:
+    """
+    Imputes missing values in a categorical column using statistical mode or custom labels.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to process.
+        column_name: Exact name of the categorical column to impute. Works with string or object dtype.
+        method: Imputation strategy. Options: 'mode' (most frequent value, fallback to 'unknown' if no mode), 'unknown' (literal string), or any custom string value. Defaults to 'mode'.
+
+    Returns:
+        Success message with count of imputed NaNs, fill value used, and path to saved output file (original filename + '_filled.csv'). Returns 'No missing values' if column is complete. Returns error if column not found or file unreadable.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        if column_name not in df.columns:
+            return f"Column '{column_name}' not found"
+        
+        null_count = df[column_name].isnull().sum()
+        if null_count == 0:
+            return f"No missing values in '{column_name}'"
+        
+        if method == "mode":
+            fill_value = df[column_name].mode()[0] if len(df[column_name].mode()) > 0 else "unknown"
+        elif method == "unknown":
+            fill_value = "unknown"
+        else:
+            fill_value = method
+        
+        df[column_name] = df[column_name].fillna(fill_value)
+        
+        output_path = file_path.replace('.csv', '_filled.csv')
+        df.to_csv(output_path, index=False)
+        
+        return f"Filled {null_count} nulls in '{column_name}' with '{fill_value}'. Saved to: {output_path}"
+    except Exception as e:
+        return f"Error filling categorical nulls: {str(e)}"
+
+
+@tool
+def encode_categorical(file_path: str, column_name: str, encoding_type: str = "onehot") -> str:
+    """
+    Transforms a categorical column into numeric representation using one-hot or label encoding.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to process.
+        column_name: Exact name of the categorical column to encode. Original column is removed for one-hot, preserved for label encoding.
+        encoding_type: Encoding method. Options: 'onehot' (creates binary indicator columns, drops original), 'label' (maps categories to integers 0 to N-1, creates new '_encoded' column). Defaults to 'onehot'.
+
+    Returns:
+        For one-hot: success message with count of new columns created. For label: success message with category-to-integer mapping dictionary. Includes path to saved output file (original filename + '_encoded.csv'). Returns error if column not found or encoding_type invalid.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        if column_name not in df.columns:
+            return f"Column '{column_name}' not found"
+        
+        if encoding_type == "onehot":
+            dummies = pd.get_dummies(df[column_name], prefix=column_name, dtype=int)
+            df = pd.concat([df, dummies], axis=1)
+            df = df.drop(columns=[column_name])
+            msg = f"One-hot encoded '{column_name}' into {len(dummies.columns)} columns"
+        elif encoding_type == "label":
+            le = LabelEncoder()
+            df[f"{column_name}_encoded"] = le.fit_transform(df[column_name].fillna('missing'))
+            mapping = dict(zip(le.classes_, le.transform(le.classes_)))
+            msg = f"Label encoded '{column_name}'. Mapping: {mapping}"
+        else:
+            return f"Unknown encoding type: {encoding_type}"
+        
+        output_path = file_path.replace('.csv', '_encoded.csv')
+        df.to_csv(output_path, index=False)
+        
+        return f"{msg}. Saved to: {output_path}"
+    except Exception as e:
+        return f"Error encoding: {str(e)}"
+
+
+@tool
+def create_new_feature(file_path: str, new_column: str, column1: str, operation: str, column2_or_value: Union[str, float]) -> str:
+    """
+    Engineers a new feature column by applying arithmetic or comparison operations between existing columns or values.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to augment.
+        new_column: Name for the newly created feature column. Must not already exist in dataset.
+        column1: Name of the first column in the operation. Must contain numeric data for arithmetic ops.
+        operation: Operation to apply. Arithmetic: '+', '-', '*', '/' (create numeric column). Comparison: '>', '<', '==' (create boolean column). Applied as: column1 op column2_or_value.
+        column2_or_value: Either exact name of a second column (for column-column operations) or a numeric scalar (for column-scalar operations).
+
+    Returns:
+        Success message with operation description, sample of new feature values, and path to saved output file (original filename + '_featured.csv'). Returns error if columns not found, new_column already exists, or operation invalid.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        
+        if column1 not in df.columns:
+            return f"Column '{column1}' not found"
+        
+        # Check if column2_or_value is a column name or a value
+        if isinstance(column2_or_value, str) and column2_or_value in df.columns:
+            operand2 = df[column2_or_value]
+        else:
+            try:
+                operand2 = float(column2_or_value)
+            except:
+                operand2 = column2_or_value
+        
+        operand1 = df[column1]
+        
+        if operation == '+':
+            df[new_column] = operand1 + operand2
+        elif operation == '-':
+            df[new_column] = operand1 - operand2
+        elif operation == '*':
+            df[new_column] = operand1 * operand2
+        elif operation == '/':
+            df[new_column] = operand1 / operand2
+        elif operation == '>':
+            df[new_column] = (operand1 > operand2).astype(int)
+        elif operation == '<':
+            df[new_column] = (operand1 < operand2).astype(int)
+        elif operation == '==':
+            df[new_column] = (operand1 == operand2).astype(int)
+        else:
+            return f"Unknown operation: {operation}"
+        
+        output_path = file_path.replace('.csv', '_new_feature.csv')
+        df.to_csv(output_path, index=False)
+        
+        return f"Created new feature '{new_column}' using {column1} {operation} {column2_or_value}. Saved to: {output_path}"
+    except Exception as e:
+        return f"Error creating feature: {str(e)}"
+
+
+@tool
+def normalize_column(file_path: str, column_name: str, method: str = "minmax") -> str:
+    """
+    Scales a numeric column using min-max normalization or z-score standardization for ML preprocessing.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to process.
+        column_name: Exact name of the numeric column to scale. Must contain numeric data (int/float).
+        method: Scaling algorithm. Options: 'minmax' (scales to [0,1] range via sklearn MinMaxScaler), 'zscore' (standardizes to mean=0, std=1 via sklearn StandardScaler). Defaults to 'minmax'.
+
+    Returns:
+        Success message with scaling method and new column name ('{column_name}_normalized' or '{column_name}_standardized'), plus path to saved output file (original filename + '_normalized.csv'). Returns error if column not found, non-numeric, or method invalid.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        if column_name not in df.columns:
+            return f"Column '{column_name}' not found"
+        
+        col = df[column_name].values.reshape(-1, 1)
+        
+        if method == "minmax":
+            scaler = MinMaxScaler()
+            df[f"{column_name}_normalized"] = scaler.fit_transform(col)
+            msg = f"Min-max normalized '{column_name}' to range [0, 1]"
+        elif method == "zscore":
+            scaler = StandardScaler()
+            df[f"{column_name}_standardized"] = scaler.fit_transform(col)
+            msg = f"Z-score standardized '{column_name}' (mean=0, std=1)"
+        else:
+            return f"Unknown method: {method}"
+        
+        output_path = file_path.replace('.csv', '_normalized.csv')
+        df.to_csv(output_path, index=False)
+        
+        return f"{msg}. Saved to: {output_path}"
+    except Exception as e:
+        return f"Error normalizing: {str(e)}"
+
+
+# ============================================================================
+# DATA FILTERING AND SELECTION TOOLS
+# ============================================================================
+
+@tool
+def filter_rows_numeric(file_path: str, column_name: str, operator: str, value: float) -> str:
+    """
+    Filters dataset rows by applying a numeric comparison condition to a specified column.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to filter.
+        column_name: Exact name of the numeric column to filter on. Must contain numeric data.
+        operator: Comparison operator. Options: '>' (greater than), '<' (less than), '>=' (greater or equal), '<=' (less or equal), '==' (equal), '!=' (not equal).
+        value: Numeric threshold for comparison. Must be compatible with column data type.
+
+    Returns:
+        Success message with original and filtered row counts, applied condition ('{column_name} {operator} {value}'), and path to saved output file (original filename + '_filtered.csv'). Returns error if column not found or operator invalid.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        if column_name not in df.columns:
+            return f"Column '{column_name}' not found"
+        
+        original_len = len(df)
+        
+        if operator == '>':
+            df_filtered = df[df[column_name] > value]
+        elif operator == '<':
+            df_filtered = df[df[column_name] < value]
+        elif operator == '>=':
+            df_filtered = df[df[column_name] >= value]
+        elif operator == '<=':
+            df_filtered = df[df[column_name] <= value]
+        elif operator == '==':
+            df_filtered = df[df[column_name] == value]
+        elif operator == '!=':
+            df_filtered = df[df[column_name] != value]
+        else:
+            return f"Unknown operator: {operator}"
+        
+        output_path = file_path.replace('.csv', '_filtered.csv')
+        df_filtered.to_csv(output_path, index=False)
+        
+        return f"Filtered {original_len} -> {len(df_filtered)} rows where {column_name} {operator} {value}. Saved to: {output_path}"
+    except Exception as e:
+        return f"Error filtering: {str(e)}"
+
+
+@tool
+def filter_rows_categorical(file_path: str, column_name: str, values: str, include: bool = True) -> str:
+    """
+    Filters dataset rows by including or excluding specific categorical values from a column.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to filter.
+        column_name: Exact name of the categorical column to filter on. Works with string or object dtype.
+        values: Comma-separated string of values to filter (e.g., 'Male,Female' or 'A,B,C'). Whitespace around commas is trimmed.
+        include: Filter mode. True: keep only rows with these values (whitelist). False: exclude rows with these values (blacklist). Defaults to True.
+
+    Returns:
+        Success message with original and filtered row counts, action performed (included/excluded), list of values, and path to saved output file (original filename + '_filtered.csv'). Returns error if column not found or file unreadable.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        if column_name not in df.columns:
+            return f"Column '{column_name}' not found"
+        
+        value_list = [v.strip() for v in values.split(',')]
+        original_len = len(df)
+        
+        if include:
+            df_filtered = df[df[column_name].isin(value_list)]
+            action = "included"
+        else:
+            df_filtered = df[~df[column_name].isin(value_list)]
+            action = "excluded"
+        
+        output_path = file_path.replace('.csv', '_filtered.csv')
+        df_filtered.to_csv(output_path, index=False)
+        
+        return f"Filtered {original_len} -> {len(df_filtered)} rows. {action}: {value_list}. Saved to: {output_path}"
+    except Exception as e:
+        return f"Error filtering: {str(e)}"
+
+
+@tool
+def select_columns(file_path: str, columns: str) -> str:
+    """
+    Extracts a subset of columns from the dataset, removing all others.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to subset.
+        columns: Comma-separated string of column names to retain (e.g., 'Name,Age,Score'). Column order is preserved as specified. Whitespace around commas is trimmed.
+
+    Returns:
+        Success message with count of selected columns, new dataset shape, and path to saved output file (original filename + '_selected.csv'). Returns error if any specified column is not found in dataset or file unreadable.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        col_list = [c.strip() for c in columns.split(',')]
+        
+        missing = [c for c in col_list if c not in df.columns]
+        if missing:
+            return f"Columns not found: {missing}"
+        
+        df_selected = df[col_list]
+        
+        output_path = file_path.replace('.csv', '_selected.csv')
+        df_selected.to_csv(output_path, index=False)
+        
+        return f"Selected {len(col_list)} columns. New shape: {df_selected.shape}. Saved to: {output_path}"
+    except Exception as e:
+        return f"Error selecting columns: {str(e)}"
+
+
+# ============================================================================
+# STATISTICAL ANALYSIS TOOLS
+# ============================================================================
+
+@tool
+def calculate_correlation(file_path: str, column1: str, column2: str, method: str = "pearson") -> str:
+    """
+    Computes correlation coefficient and statistical significance between two numeric columns.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to analyze.
+        column1: Exact name of the first numeric column. Must contain numeric data (int/float).
+        column2: Exact name of the second numeric column. Must contain numeric data (int/float).
+        method: Correlation algorithm. Options: 'pearson' (linear correlation), 'spearman' (rank-based, handles non-linear). Defaults to 'pearson'.
+
+    Returns:
+        Multi-line string with: correlation coefficient (range [-1, 1]), p-value, statistical significance assessment, and qualitative strength interpretation (weak/moderate/strong). Automatically drops rows with missing values in either column. Returns error if columns not found, non-numeric, or method invalid.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        
+        for col in [column1, column2]:
+            if col not in df.columns:
+                return f"Column '{col}' not found"
+        
+        # Remove rows with missing values
+        data = df[[column1, column2]].dropna()
+        
+        if method == "pearson":
+            corr, p_value = pearsonr(data[column1], data[column2])
+        elif method == "spearman":
+            corr, p_value = spearmanr(data[column1], data[column2])
+        else:
+            return f"Unknown method: {method}"
+        
+        interpretation = ""
+        abs_corr = abs(corr)
+        if abs_corr < 0.3:
+            strength = "weak"
+        elif abs_corr < 0.7:
+            strength = "moderate"
+        else:
+            strength = "strong"
+        
+        direction = "positive" if corr > 0 else "negative"
+        
+        return f"{method.capitalize()} correlation between '{column1}' and '{column2}': {corr:.4f} (p-value: {p_value:.4f}). This is a {strength} {direction} correlation."
+    except Exception as e:
+        return f"Error calculating correlation: {str(e)}"
+
+
+@tool
+def perform_ttest(file_path: str, column_name: str, group_column: str) -> str:
+    """
+    Performs independent two-sample t-test to compare means between two groups.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to analyze.
+        column_name: Exact name of the numeric column containing values to compare. Must contain numeric data.
+        group_column: Exact name of the categorical column defining two groups. Must contain exactly 2 unique values.
+
+    Returns:
+        Multi-line string with: group names and their means/sample sizes, t-statistic, p-value, and significance assessment at α=0.05 level. Automatically drops NaN values. Returns error if columns not found or group_column has ≠2 groups.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        
+        if column_name not in df.columns or group_column not in df.columns:
+            return "Column not found"
+        
+        groups = df[group_column].unique()
+        if len(groups) != 2:
+            return f"T-test requires exactly 2 groups. Found {len(groups)}: {groups}"
+        
+        group1 = df[df[group_column] == groups[0]][column_name].dropna()
+        group2 = df[df[group_column] == groups[1]][column_name].dropna()
+        
+        t_stat, p_value = stats.ttest_ind(group1, group2)
+        
+        mean1, mean2 = group1.mean(), group2.mean()
+        
+        sig = "statistically significant" if p_value < 0.05 else "not statistically significant"
+        
+        return f"T-test for '{column_name}' between groups:\n  {groups[0]}: mean={mean1:.2f}, n={len(group1)}\n  {groups[1]}: mean={mean2:.2f}, n={len(group2)}\n  t-statistic: {t_stat:.4f}\n  p-value: {p_value:.4f}\n  Result: {sig} (α=0.05)"
+    except Exception as e:
+        return f"Error performing t-test: {str(e)}"
+
+
+@tool
+def chi_square_test(file_path: str, column1: str, column2: str) -> str:
+    """
+    Performs chi-square test of independence to assess association between two categorical variables.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to analyze.
+        column1: Exact name of the first categorical column. Works with string or object dtype.
+        column2: Exact name of the second categorical column. Works with string or object dtype.
+
+    Returns:
+        Multi-line string with: chi-square statistic, p-value, degrees of freedom, and independence assessment at α=0.05 level (dependent/independent). Creates contingency table internally. Returns error if columns not found or data incompatible with chi-square test.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        
+        if column1 not in df.columns or column2 not in df.columns:
+            return "Column not found"
+        
+        # Create contingency table
+        contingency = pd.crosstab(df[column1], df[column2])
+        
+        chi2, p_value, dof, expected = chi2_contingency(contingency)
+        
+        sig = "dependent" if p_value < 0.05 else "independent"
+        
+        return f"Chi-square test between '{column1}' and '{column2}':\n  Chi-square statistic: {chi2:.4f}\n  p-value: {p_value:.4f}\n  Degrees of freedom: {dof}\n  Result: Variables are {sig} (α=0.05)"
+    except Exception as e:
+        return f"Error performing chi-square test: {str(e)}"
+
+
+@tool
+def calculate_group_statistics(file_path: str, value_column: str, group_column: str) -> str:
+    """
+    Computes comprehensive descriptive statistics for a numeric column segmented by categorical groups.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to analyze.
+        value_column: Exact name of the numeric column to compute statistics on. Must contain numeric data.
+        group_column: Exact name of the categorical column to segment by. Each unique value creates a group.
+
+    Returns:
+        Formatted table string with per-group statistics: count, mean, standard deviation, min, and max. Returns error if columns not found or value_column non-numeric.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        
+        if value_column not in df.columns or group_column not in df.columns:
+            return "Column not found"
+        
+        grouped = df.groupby(group_column)[value_column].agg([
+            'count', 'mean', 'std', 'min', 'max'
+        ])
+        
+        result = f"Group statistics for '{value_column}' by '{group_column}':\n"
+        result += grouped.to_string()
+        
+        return result
+    except Exception as e:
+        return f"Error calculating group statistics: {str(e)}"
+
+
+# ============================================================================
+# DATA VISUALIZATION TOOLS
+# ============================================================================
+
+@tool
+def create_histogram(file_path: str, column_name: str, bins: int = 20) -> str:
+    """
+    Generates a histogram visualization showing the distribution of values in a numeric column.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to visualize.
+        column_name: Exact name of the numeric column to plot. Must contain numeric data.
+        bins: Number of histogram bins to divide the data range into. Must be positive integer. Defaults to 20.
+
+    Returns:
+        Success message with column name, descriptive statistics (mean, median, std), and path to saved PNG file (original filename + '_histogram_{column_name}.png'). Excludes NaN values. Returns error if column not found or non-numeric.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        if column_name not in df.columns:
+            return f"Column '{column_name}' not found"
+        
+        plt.figure(figsize=(10, 6))
+        plt.hist(df[column_name].dropna(), bins=bins, edgecolor='black', alpha=0.7)
+        plt.title(f'Histogram of {column_name}')
+        plt.xlabel(column_name)
+        plt.ylabel('Frequency')
+        plt.grid(True, alpha=0.3)
+        
+        output_path = file_path.replace('.csv', f'_histogram_{column_name}.png')
+        plt.savefig(output_path, dpi=100, bbox_inches='tight')
+        plt.close()
+        
+        # Calculate statistics
+        data = df[column_name].dropna()
+        stats_info = f"Mean: {data.mean():.2f}, Median: {data.median():.2f}, Std: {data.std():.2f}"
+        
+        return f"Histogram created for '{column_name}'. {stats_info}. Saved to: {output_path}"
+    except Exception as e:
+        return f"Error creating histogram: {str(e)}"
+
+
+@tool
+def create_scatter_plot(file_path: str, x_column: str, y_column: str, color_column: Optional[str] = None) -> str:
+    """
+    Generates a scatter plot visualizing the relationship between two numeric variables with optional categorical color-coding.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to visualize.
+        x_column: Exact name of the numeric column for x-axis. Must contain numeric data.
+        y_column: Exact name of the numeric column for y-axis. Must contain numeric data.
+        color_column: Optional exact name of categorical column for color-coding points by category. Creates separate series with legend if specified.
+
+    Returns:
+        Success message with correlation coefficient between x and y columns, and path to saved PNG file (original filename + '_scatter_{x_column}_{y_column}.png'). Returns error if columns not found or non-numeric.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        
+        for col in [x_column, y_column]:
+            if col not in df.columns:
+                return f"Column '{col}' not found"
+        
+        plt.figure(figsize=(10, 6))
+        
+        if color_column and color_column in df.columns:
+            for category in df[color_column].unique():
+                mask = df[color_column] == category
+                plt.scatter(df[mask][x_column], df[mask][y_column], label=category, alpha=0.6)
+            plt.legend()
+        else:
+            plt.scatter(df[x_column], df[y_column], alpha=0.6)
+        
+        plt.title(f'Scatter Plot: {x_column} vs {y_column}')
+        plt.xlabel(x_column)
+        plt.ylabel(y_column)
+        plt.grid(True, alpha=0.3)
+        
+        output_path = file_path.replace('.csv', f'_scatter_{x_column}_{y_column}.png')
+        plt.savefig(output_path, dpi=100, bbox_inches='tight')
+        plt.close()
+        
+        # Calculate correlation
+        corr = df[[x_column, y_column]].corr().iloc[0, 1]
+        
+        return f"Scatter plot created. Correlation: {corr:.3f}. Saved to: {output_path}"
+    except Exception as e:
+        return f"Error creating scatter plot: {str(e)}"
+
+
+@tool
+def create_bar_chart(file_path: str, column_name: str, top_n: int = 10) -> str:
+    """
+    Generates a bar chart visualizing value frequencies for a categorical column.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to visualize.
+        column_name: Exact name of the categorical column to plot. Works with string, object, or low-cardinality numeric data.
+        top_n: Maximum number of most frequent categories to display. Must be positive integer. Defaults to 10.
+
+    Returns:
+        Success message with column name, most frequent value and its count, and path to saved PNG file (original filename + '_bar_{column_name}.png'). Returns error if column not found or file unreadable.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        if column_name not in df.columns:
+            return f"Column '{column_name}' not found"
+        
+        value_counts = df[column_name].value_counts().head(top_n)
+        
+        plt.figure(figsize=(10, 6))
+        value_counts.plot(kind='bar', edgecolor='black', alpha=0.7)
+        plt.title(f'Bar Chart: Top {top_n} values in {column_name}')
+        plt.xlabel(column_name)
+        plt.ylabel('Count')
+        plt.xticks(rotation=45, ha='right')
+        plt.grid(True, alpha=0.3, axis='y')
+        
+        output_path = file_path.replace('.csv', f'_bar_{column_name}.png')
+        plt.savefig(output_path, dpi=100, bbox_inches='tight')
+        plt.close()
+        
+        return f"Bar chart created for '{column_name}'. Top value: {value_counts.index[0]} ({value_counts.iloc[0]} occurrences). Saved to: {output_path}"
+    except Exception as e:
+        return f"Error creating bar chart: {str(e)}"
+
+
+@tool
+def create_correlation_heatmap(file_path: str, columns: Optional[str] = None) -> str:
+    """
+    Generates a color-coded heatmap visualizing pairwise correlations between numeric columns.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to visualize.
+        columns: Optional comma-separated string of specific column names to include (e.g., 'Age,Income,Score'). If None, uses all numeric columns in dataset. Whitespace around commas is trimmed.
+
+    Returns:
+        Success message with count of included columns and path to saved PNG file (original filename + '_correlation_heatmap.png'). Requires at least 2 numeric columns. Uses seaborn heatmap with annotations. Returns error if insufficient numeric columns or specified columns not found.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        
+        if columns:
+            col_list = [c.strip() for c in columns.split(',')]
+            df_numeric = df[col_list]
+        else:
+            df_numeric = df.select_dtypes(include=[np.number])
+        
+        if df_numeric.shape[1] < 2:
+            return "Need at least 2 numeric columns for correlation heatmap"
+        
+        plt.figure(figsize=(12, 8))
+        corr_matrix = df_numeric.corr()
+        
+        sns.heatmap(corr_matrix, annot=True, fmt='.2f', cmap='coolwarm', center=0, 
+                    square=True, linewidths=1, cbar_kws={"shrink": 0.8})
+        plt.title('Correlation Heatmap')
+        
+        output_path = file_path.replace('.csv', '_correlation_heatmap.png')
+        plt.savefig(output_path, dpi=100, bbox_inches='tight')
+        plt.close()
+        
+        # Find strongest correlations
+        upper_tri = np.triu(np.ones_like(corr_matrix), k=1)
+        upper_tri_corr = corr_matrix.where(upper_tri.astype(bool))
+        strongest = upper_tri_corr.abs().unstack().nlargest(3)
+        
+        return f"Correlation heatmap created for {corr_matrix.shape[0]} variables. Saved to: {output_path}"
+    except Exception as e:
+        return f"Error creating heatmap: {str(e)}"
+
+
+# ============================================================================
+# ENHANCED MACHINE LEARNING TOOLS
+# ============================================================================
+
+@tool
+def train_random_forest_model(file_path: str, target_column: str, feature_columns: str, task_type: str = "classification") -> str:
+    """
+    Trains a Random Forest ensemble model with automated preprocessing, feature importance analysis, and cross-validation.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file containing training data.
+        target_column: Name of the target variable to predict.
+        feature_columns: Comma-separated list of feature column names (e.g., 'Age,Fare,Pclass'). Categorical features are automatically label-encoded, missing values imputed with mean (numeric) or mode (categorical).
+        task_type: ML task type. Options: 'classification' (RandomForestClassifier with 100 trees), 'regression' (RandomForestRegressor with 100 trees). Defaults to 'classification'.
+
+    Returns:
+        Dictionary-formatted string with: model type, features/target, train/test sizes, performance metrics (accuracy/precision/recall/F1 for classification; MSE/R² for regression), 5-fold cross-validation scores (mean±std), feature importance rankings, and path to saved model file (original filename + '_rf_{task_type}_model.joblib'). Returns error if columns not found or task_type invalid.
+    """
+    try:
+        df = pd.read_csv(file_path)
+
+        # Parse feature columns
+        features = [col.strip() for col in feature_columns.split(',')]
+
+        # Check if columns exist
+        for col in features + [target_column]:
+            if col not in df.columns:
+                return f"Column '{col}' not found in dataset"
+
+        # Prepare data
+        X = df[features]
+        y = df[target_column]
+
+        # Handle missing values
+        X = X.fillna(X.mean())
+        if task_type == "classification":
+            y = y.fillna(y.mode()[0])
+        else:
+            y = y.fillna(y.mean())
+
+        # Handle categorical variables
+        for col in X.columns:
+            if X[col].dtype == 'object':
+                le = LabelEncoder()
+                X[col] = le.fit_transform(X[col].astype(str))
+
+        if task_type == "classification" and y.dtype == 'object':
+            le_target = LabelEncoder()
+            y = le_target.fit_transform(y.astype(str))
+
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        # Train model
+        if task_type == "classification":
+            model = RandomForestClassifier(n_estimators=100, random_state=42)
+            scoring_metric = 'accuracy'
+        else:
+            model = RandomForestRegressor(n_estimators=100, random_state=42)
+            scoring_metric = 'r2'
+
+        model.fit(X_train, y_train)
+
+        # Make predictions
+        y_pred = model.predict(X_test)
+
+        # Calculate metrics
+        if task_type == "classification":
+            accuracy = accuracy_score(y_test, y_pred)
+            precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+            recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+            f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+
+            metrics = {
+                "accuracy": round(accuracy, 4),
+                "precision": round(precision, 4),
+                "recall": round(recall, 4),
+                "f1_score": round(f1, 4)
+            }
+        else:
+            mse = mean_squared_error(y_test, y_pred)
+            r2 = r2_score(y_test, y_pred)
+
+            metrics = {
+                "mse": round(mse, 4),
+                "r2_score": round(r2, 4)
+            }
+
+        # Feature importance
+        feature_importance = dict(zip(features, [round(imp, 4) for imp in model.feature_importances_]))
+
+        # Cross-validation
+        cv_scores = cross_val_score(model, X, y, cv=5, scoring=scoring_metric)
+
+        # Save model
+        model_path = file_path.replace('.csv', f'_rf_{task_type}_model.joblib')
+        joblib.dump(model, model_path)
+
+        results = {
+            "model_type": f"Random Forest {task_type}",
+            "features": features,
+            "target": target_column,
+            "train_size": len(X_train),
+            "test_size": len(X_test),
+            **metrics,
+            "cv_score_mean": round(cv_scores.mean(), 4),
+            "cv_score_std": round(cv_scores.std(), 4),
+            "feature_importance": feature_importance,
+            "model_saved": model_path
+        }
+
+        return f"Random Forest model trained: {results}"
+
+    except Exception as e:
+        return f"Error training Random Forest model: {str(e)}"
+
+
+@tool
+def train_knn_model(file_path: str, target_column: str, feature_columns: str, task_type: str = "classification", n_neighbors: int = 5) -> str:
+    """
+    Trains a K-Nearest Neighbors model using distance-based learning with automated preprocessing and cross-validation.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file containing training data.
+        target_column: Name of the target variable to predict.
+        feature_columns: Comma-separated list of feature column names (e.g., 'Age,Fare,Pclass'). Categorical features are automatically label-encoded, missing values imputed.
+        task_type: ML task type. Options: 'classification' (KNeighborsClassifier), 'regression' (KNeighborsRegressor). Defaults to 'classification'.
+        n_neighbors: Number of nearest neighbors for predictions. Must be positive integer ≥1. Defaults to 5. Higher values = smoother decision boundaries.
+
+    Returns:
+        Dictionary-formatted string with: model type, K value, features/target, train/test sizes, performance metrics (accuracy/precision/recall/F1 for classification; MSE/R² for regression), 5-fold cross-validation scores (mean±std), and path to saved model file (original filename + '_knn_{task_type}_model.joblib'). Returns error if columns not found, task_type invalid, or n_neighbors ≤0.
+    """
+    try:
+        df = pd.read_csv(file_path)
+
+        # Parse feature columns
+        features = [col.strip() for col in feature_columns.split(',')]
+
+        # Check if columns exist
+        for col in features + [target_column]:
+            if col not in df.columns:
+                return f"Column '{col}' not found in dataset"
+
+        # Prepare data
+        X = df[features]
+        y = df[target_column]
+
+        # Handle missing values
+        X = X.fillna(X.mean())
+        if task_type == "classification":
+            y = y.fillna(y.mode()[0])
+        else:
+            y = y.fillna(y.mean())
+
+        # Handle categorical variables
+        for col in X.columns:
+            if X[col].dtype == 'object':
+                le = LabelEncoder()
+                X[col] = le.fit_transform(X[col].astype(str))
+
+        if task_type == "classification" and y.dtype == 'object':
+            le_target = LabelEncoder()
+            y = le_target.fit_transform(y.astype(str))
+
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        # Train model
+        if task_type == "classification":
+            model = KNeighborsClassifier(n_neighbors=n_neighbors)
+            scoring_metric = 'accuracy'
+        else:
+            model = KNeighborsRegressor(n_neighbors=n_neighbors)
+            scoring_metric = 'r2'
+
+        model.fit(X_train, y_train)
+
+        # Make predictions
+        y_pred = model.predict(X_test)
+
+        # Calculate metrics
+        if task_type == "classification":
+            accuracy = accuracy_score(y_test, y_pred)
+            precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+            recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+            f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+
+            metrics = {
+                "accuracy": round(accuracy, 4),
+                "precision": round(precision, 4),
+                "recall": round(recall, 4),
+                "f1_score": round(f1, 4)
+            }
+        else:
+            mse = mean_squared_error(y_test, y_pred)
+            r2 = r2_score(y_test, y_pred)
+
+            metrics = {
+                "mse": round(mse, 4),
+                "r2_score": round(r2, 4)
+            }
+
+        # Cross-validation
+        cv_scores = cross_val_score(model, X, y, cv=5, scoring=scoring_metric)
+
+        # Save model
+        model_path = file_path.replace('.csv', f'_knn_{task_type}_model.joblib')
+        joblib.dump(model, model_path)
+
+        results = {
+            "model_type": f"KNN {task_type}",
+            "n_neighbors": n_neighbors,
+            "features": features,
+            "target": target_column,
+            "train_size": len(X_train),
+            "test_size": len(X_test),
+            **metrics,
+            "cv_score_mean": round(cv_scores.mean(), 4),
+            "cv_score_std": round(cv_scores.std(), 4),
+            "model_saved": model_path
+        }
+
+        return f"KNN model trained: {results}"
+
+    except Exception as e:
+        return f"Error training KNN model: {str(e)}"
+
+
+@tool
+def train_svm_model(file_path: str, target_column: str, feature_columns: str, task_type: str = "classification") -> str:
+    """
+    Trains a Support Vector Machine model with RBF kernel for non-linear classification or regression.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file containing training data.
+        target_column: Name of the target variable to predict.
+        feature_columns: Comma-separated list of feature column names (e.g., 'Age,Fare,Pclass'). Categorical features are automatically label-encoded, missing values imputed.
+        task_type: ML task type. Options: 'classification' (SVC with RBF kernel), 'regression' (SVR with RBF kernel). Defaults to 'classification'.
+
+    Returns:
+        Dictionary-formatted string with: model type, features/target, train/test sizes, performance metrics (accuracy/precision/recall/F1 for classification; MSE/R² for regression), 5-fold cross-validation scores (mean±std), and path to saved model file (original filename + '_svm_{task_type}_model.joblib'). Note: SVMs can be slower on large datasets. Returns error if columns not found or task_type invalid.
+    """
+    try:
+        df = pd.read_csv(file_path)
+
+        # Parse feature columns
+        features = [col.strip() for col in feature_columns.split(',')]
+
+        # Check if columns exist
+        for col in features + [target_column]:
+            if col not in df.columns:
+                return f"Column '{col}' not found in dataset"
+
+        # Prepare data
+        X = df[features]
+        y = df[target_column]
+
+        # Handle missing values
+        X = X.fillna(X.mean())
+        if task_type == "classification":
+            y = y.fillna(y.mode()[0])
+        else:
+            y = y.fillna(y.mean())
+
+        # Handle categorical variables
+        for col in X.columns:
+            if X[col].dtype == 'object':
+                le = LabelEncoder()
+                X[col] = le.fit_transform(X[col].astype(str))
+
+        if task_type == "classification" and y.dtype == 'object':
+            le_target = LabelEncoder()
+            y = le_target.fit_transform(y.astype(str))
+
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        # Train model
+        if task_type == "classification":
+            model = SVC(kernel='rbf', random_state=42)
+            scoring_metric = 'accuracy'
+        else:
+            model = SVR(kernel='rbf')
+            scoring_metric = 'r2'
+
+        model.fit(X_train, y_train)
+
+        # Make predictions
+        y_pred = model.predict(X_test)
+
+        # Calculate metrics
+        if task_type == "classification":
+            accuracy = accuracy_score(y_test, y_pred)
+            precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+            recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+            f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+
+            metrics = {
+                "accuracy": round(accuracy, 4),
+                "precision": round(precision, 4),
+                "recall": round(recall, 4),
+                "f1_score": round(f1, 4)
+            }
+        else:
+            mse = mean_squared_error(y_test, y_pred)
+            r2 = r2_score(y_test, y_pred)
+
+            metrics = {
+                "mse": round(mse, 4),
+                "r2_score": round(r2, 4)
+            }
+
+        # Cross-validation
+        cv_scores = cross_val_score(model, X, y, cv=5, scoring=scoring_metric)
+
+        # Save model
+        model_path = file_path.replace('.csv', f'_svm_{task_type}_model.joblib')
+        joblib.dump(model, model_path)
+
+        results = {
+            "model_type": f"SVM {task_type}",
+            "features": features,
+            "target": target_column,
+            "train_size": len(X_train),
+            "test_size": len(X_test),
+            **metrics,
+            "cv_score_mean": round(cv_scores.mean(), 4),
+            "cv_score_std": round(cv_scores.std(), 4),
+            "model_saved": model_path
+        }
+
+        return f"SVM model trained: {results}"
+
+    except Exception as e:
+        return f"Error training SVM model: {str(e)}"
+
+
+@tool
+def evaluate_model(model_path: str, test_data_path: str, target_column: str, feature_columns: str) -> str:
+    """
+    Evaluates a previously trained model on new test data with automatic task detection and appropriate metrics.
+
+    Args:
+        model_path: Absolute or relative path to the saved model file (.joblib format from joblib.dump()).
+        test_data_path: Absolute or relative path to the CSV file containing test/validation data.
+        target_column: Name of the target variable column in test data. Must match training target semantics.
+        feature_columns: Comma-separated list of feature column names (e.g., 'Age,Fare,Pclass'). Must match features used during training. Categorical features automatically label-encoded.
+
+    Returns:
+        Dictionary-formatted string with: model type, task (classification/regression), test sample count, and task-specific metrics (accuracy/precision/recall/F1 for classification; MSE/RMSE/R² for regression). Automatically detects task from model type. Returns error if model file not found, columns missing, or feature mismatch.
+    """
+    try:
+        # Load the model
+        model = joblib.load(model_path)
+
+        # Load test data
+        df = pd.read_csv(test_data_path)
+
+        # Parse feature columns
+        features = [col.strip() for col in feature_columns.split(',')]
+
+        # Check if columns exist
+        for col in features + [target_column]:
+            if col not in df.columns:
+                return f"Column '{col}' not found in test dataset"
+
+        # Prepare test data
+        X = df[features]
+        y = df[target_column]
+
+        # Handle missing values
+        X = X.fillna(X.mean())
+
+        # Handle categorical variables (same as training)
+        for col in X.columns:
+            if X[col].dtype == 'object':
+                le = LabelEncoder()
+                X[col] = le.fit_transform(X[col].astype(str))
+
+        # Make predictions
+        y_pred = model.predict(X)
+
+        # Determine if this is classification or regression based on model type
+        model_name = str(type(model).__name__)
+        is_classification = any(clf in model_name for clf in ['Classifier', 'SVC'])
+
+        # Calculate appropriate metrics
+        if is_classification:
+            accuracy = accuracy_score(y, y_pred)
+            precision = precision_score(y, y_pred, average='weighted', zero_division=0)
+            recall = recall_score(y, y_pred, average='weighted', zero_division=0)
+            f1 = f1_score(y, y_pred, average='weighted', zero_division=0)
+
+            results = {
+                "model_type": model_name,
+                "task": "classification",
+                "test_samples": len(X),
+                "accuracy": round(accuracy, 4),
+                "precision": round(precision, 4),
+                "recall": round(recall, 4),
+                "f1_score": round(f1, 4)
+            }
+        else:
+            mse = mean_squared_error(y, y_pred)
+            r2 = r2_score(y, y_pred)
+            rmse = np.sqrt(mse)
+
+            results = {
+                "model_type": model_name,
+                "task": "regression",
+                "test_samples": len(X),
+                "mse": round(mse, 4),
+                "rmse": round(rmse, 4),
+                "r2_score": round(r2, 4)
+            }
+
+        return f"Model evaluation results: {results}"
+
+    except Exception as e:
+        return f"Error evaluating model: {str(e)}"
+
+
+
+@tool
+def train_logistic_regression(file_path: str, target_column: str, feature_columns: str) -> str:
+    """
+    Trains a logistic regression model for binary classification with probability estimates and AUC scoring.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file containing training data.
+        target_column: Name of the binary target variable (0/1 or two categorical values). Automatically label-encoded if categorical.
+        feature_columns: Comma-separated list of feature column names (e.g., 'Age,Fare,Pclass'). Categorical features automatically label-encoded, missing values imputed with mean.
+
+    Returns:
+        Multi-line string with: accuracy, precision, recall, F1 score, AUC-ROC (for binary), top 3 features by absolute coefficient magnitude, and path to saved model file (original filename + '_logistic_model.joblib'). Returns error if columns not found or data incompatible with logistic regression.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        features = [col.strip() for col in feature_columns.split(',')]
+        
+        # Prepare data
+        X = df[features]
+        y = df[target_column]
+        
+        # Handle categorical features
+        for col in X.columns:
+            if X[col].dtype == 'object':
+                le = LabelEncoder()
+                X[col] = le.fit_transform(X[col].fillna('missing'))
+        
+        # Handle missing values
+        X = X.fillna(X.mean())
+        
+        # Encode target if categorical
+        if y.dtype == 'object':
+            le_target = LabelEncoder()
+            y = le_target.fit_transform(y)
+        
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        # Train model
+        model = LogisticRegression(max_iter=1000, random_state=42)
+        model.fit(X_train, y_train)
+        
+        # Predictions
+        y_pred = model.predict(X_test)
+        y_proba = model.predict_proba(X_test)[:, 1]
+        
+        # Metrics
+        acc = accuracy_score(y_test, y_pred)
+        prec = precision_score(y_test, y_pred, average='binary')
+        rec = recall_score(y_test, y_pred, average='binary')
+        f1 = f1_score(y_test, y_pred, average='binary')
+        
+        # Check if binary classification for AUC
+        if len(np.unique(y)) == 2:
+            auc = roc_auc_score(y_test, y_proba)
+            auc_str = f", AUC: {auc:.3f}"
+        else:
+            auc_str = ""
+        
+        # Feature importance (coefficients)
+        importance = dict(zip(features, model.coef_[0]))
+        top_features = sorted(importance.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
+        
+        # Save model
+        model_path = file_path.replace('.csv', '_logistic_model.joblib')
+        joblib.dump(model, model_path)
+        
+        return f"Logistic Regression trained:\n  Accuracy: {acc:.3f}\n  Precision: {prec:.3f}\n  Recall: {rec:.3f}\n  F1: {f1:.3f}{auc_str}\n  Top features: {top_features}\n  Model saved: {model_path}"
+    except Exception as e:
+        return f"Error training logistic regression: {str(e)}"
+
+
+@tool
+def train_decision_tree(file_path: str, target_column: str, feature_columns: str, max_depth: int = 5) -> str:
+    """
+    Trains an interpretable decision tree classifier with configurable depth and feature importance analysis.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file containing training data.
+        target_column: Name of the target variable to classify. Automatically label-encoded if categorical.
+        feature_columns: Comma-separated list of feature column names (e.g., 'Age,Fare,Pclass'). Categorical features automatically label-encoded, missing values imputed.
+        max_depth: Maximum tree depth to prevent overfitting. Must be positive integer. Defaults to 5. Higher values = more complex trees.
+
+    Returns:
+        Multi-line string with: accuracy, max depth, top 3 features by importance, and path to saved model file (original filename + '_decision_tree.joblib'). Returns error if columns not found or max_depth invalid.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        features = [col.strip() for col in feature_columns.split(',')]
+        
+        # Prepare data
+        X = df[features]
+        y = df[target_column]
+        
+        # Handle categorical features
+        for col in X.columns:
+            if X[col].dtype == 'object':
+                le = LabelEncoder()
+                X[col] = le.fit_transform(X[col].fillna('missing'))
+        
+        X = X.fillna(X.mean())
+        
+        if y.dtype == 'object':
+            le_target = LabelEncoder()
+            y = le_target.fit_transform(y)
+        
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        # Train model
+        model = DecisionTreeClassifier(max_depth=max_depth, random_state=42)
+        model.fit(X_train, y_train)
+        
+        # Predictions
+        y_pred = model.predict(X_test)
+        
+        # Metrics
+        acc = accuracy_score(y_test, y_pred)
+        
+        # Feature importance
+        importance = dict(zip(features, model.feature_importances_))
+        top_features = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:3]
+        
+        # Save model
+        model_path = file_path.replace('.csv', '_decision_tree.joblib')
+        joblib.dump(model, model_path)
+        
+        return f"Decision Tree trained:\n  Accuracy: {acc:.3f}\n  Max depth: {max_depth}\n  Top features: {top_features}\n  Model saved: {model_path}"
+    except Exception as e:
+        return f"Error training decision tree: {str(e)}"
+
+
+@tool
+def train_gradient_boosting(file_path: str, target_column: str, feature_columns: str, n_estimators: int = 100) -> str:
+    """
+    Trains a gradient boosting classifier using sequential ensemble learning for high-accuracy predictions.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file containing training data.
+        target_column: Name of the target variable to classify. Automatically label-encoded if categorical.
+        feature_columns: Comma-separated list of feature column names (e.g., 'Age,Fare,Pclass'). Categorical features automatically label-encoded, missing values imputed.
+        n_estimators: Number of boosting stages (trees). Must be positive integer. Defaults to 100. Higher values = better accuracy but longer training.
+
+    Returns:
+        Multi-line string with: accuracy, number of estimators, top 3 features by importance, and path to saved model file (original filename + '_gradient_boosting.joblib'). Returns error if columns not found or n_estimators invalid.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        features = [col.strip() for col in feature_columns.split(',')]
+        
+        # Prepare data
+        X = df[features]
+        y = df[target_column]
+        
+        # Handle categorical features
+        for col in X.columns:
+            if X[col].dtype == 'object':
+                le = LabelEncoder()
+                X[col] = le.fit_transform(X[col].fillna('missing'))
+        
+        X = X.fillna(X.mean())
+        
+        if y.dtype == 'object':
+            le_target = LabelEncoder()
+            y = le_target.fit_transform(y)
+        
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        # Train model
+        model = GradientBoostingClassifier(n_estimators=n_estimators, random_state=42)
+        model.fit(X_train, y_train)
+        
+        # Predictions
+        y_pred = model.predict(X_test)
+        
+        # Metrics
+        acc = accuracy_score(y_test, y_pred)
+        
+        # Feature importance
+        importance = dict(zip(features, model.feature_importances_))
+        top_features = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:3]
+        
+        # Save model
+        model_path = file_path.replace('.csv', '_gradient_boosting.joblib')
+        joblib.dump(model, model_path)
+        
+        return f"Gradient Boosting trained:\n  Accuracy: {acc:.3f}\n  N estimators: {n_estimators}\n  Top features: {top_features}\n  Model saved: {model_path}"
+    except Exception as e:
+        return f"Error training gradient boosting: {str(e)}"
+
+
+@tool
+def make_prediction(model_path: str, data_path: str, feature_columns: str) -> str:
+    """
+    Generates predictions on new data using a trained model, with optional probability estimates for classification.
+
+    Args:
+        model_path: Absolute or relative path to the saved model file (.joblib format).
+        data_path: Absolute or relative path to the CSV file containing data to predict on.
+        feature_columns: Comma-separated list of feature column names (e.g., 'Age,Fare,Pclass'). Must match features used during training. Categorical features automatically label-encoded.
+
+    Returns:
+        Multi-line string with: number of predictions made, prediction distribution (class counts), and path to saved results CSV with 'prediction' column (and 'probability' for binary classification models). Output filename: original + '_predictions.csv'. Returns error if model/file not found or feature mismatch.
+    """
+    try:
+        model = joblib.load(model_path)
+        df = pd.read_csv(data_path)
+        features = [col.strip() for col in feature_columns.split(',')]
+        
+        X = df[features]
+        
+        # Handle categorical features
+        for col in X.columns:
+            if X[col].dtype == 'object':
+                le = LabelEncoder()
+                X[col] = le.fit_transform(X[col].fillna('missing'))
+        
+        X = X.fillna(X.mean())
+        
+        # Make predictions
+        predictions = model.predict(X)
+        
+        # Add predictions to dataframe
+        df['prediction'] = predictions
+        
+        # If probabilistic model, add probabilities
+        if hasattr(model, 'predict_proba'):
+            probas = model.predict_proba(X)
+            if probas.shape[1] == 2:
+                df['probability'] = probas[:, 1]
+        
+        output_path = data_path.replace('.csv', '_predictions.csv')
+        df.to_csv(output_path, index=False)
+        
+        # Summary
+        unique, counts = np.unique(predictions, return_counts=True)
+        pred_summary = dict(zip(unique, counts))
+        
+        return f"Predictions made for {len(predictions)} samples:\n  Distribution: {pred_summary}\n  Results saved to: {output_path}"
+    except Exception as e:
+        return f"Error making predictions: {str(e)}"
+
+
+@tool
+def perform_cross_validation(file_path: str, target_column: str, feature_columns: str, model_type: str = "random_forest", cv_folds: int = 5) -> str:
+    """
+    Evaluates model performance using K-fold cross-validation for robust accuracy estimation.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file containing training data.
+        target_column: Name of the target variable. Automatically label-encoded if categorical.
+        feature_columns: Comma-separated list of feature column names (e.g., 'Age,Fare,Pclass'). Categorical features automatically label-encoded, missing values imputed.
+        model_type: Algorithm to evaluate. Options: 'random_forest' (RandomForest with 100 trees), 'logistic' (LogisticRegression), 'svm' (SVC). Defaults to 'random_forest'.
+        cv_folds: Number of cross-validation folds. Must be ≥2. Defaults to 5. Higher values = more reliable but slower.
+
+    Returns:
+        Multi-line string with: model type, individual fold accuracy scores, mean accuracy, standard deviation, min, and max scores. Provides robust performance estimate independent of single train/test split. Returns error if columns not found, model_type invalid, or cv_folds invalid.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        features = [col.strip() for col in feature_columns.split(',')]
+        
+        # Prepare data
+        X = df[features]
+        y = df[target_column]
+        
+        # Handle categorical features
+        for col in X.columns:
+            if X[col].dtype == 'object':
+                le = LabelEncoder()
+                X[col] = le.fit_transform(X[col].fillna('missing'))
+        
+        X = X.fillna(X.mean())
+        
+        if y.dtype == 'object':
+            le_target = LabelEncoder()
+            y = le_target.fit_transform(y)
+        
+        # Select model
+        if model_type == "random_forest":
+            model = RandomForestClassifier(n_estimators=100, random_state=42)
+        elif model_type == "logistic":
+            model = LogisticRegression(max_iter=1000, random_state=42)
+        elif model_type == "svm":
+            model = SVC(random_state=42)
+        else:
+            return f"Unknown model type: {model_type}"
+        
+        # Perform cross-validation
+        cv_scores = cross_val_score(model, X, y, cv=cv_folds, scoring='accuracy')
+        
+        return f"Cross-validation results ({cv_folds} folds):\n  Model: {model_type}\n  Scores: {cv_scores.round(3)}\n  Mean: {cv_scores.mean():.3f}\n  Std: {cv_scores.std():.3f}\n  Min: {cv_scores.min():.3f}\n  Max: {cv_scores.max():.3f}"
+    except Exception as e:
+        return f"Error in cross-validation: {str(e)}"
+
+
+@tool
+def feature_selection(file_path: str, target_column: str, feature_columns: str, n_features: int = 5) -> str:
+    """
+    Identifies most predictive features using univariate statistical tests (ANOVA F-value) for feature engineering.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to analyze.
+        target_column: Name of the target variable. Categorical targets automatically label-encoded.
+        feature_columns: Comma-separated list of candidate feature column names (e.g., 'Age,Fare,Pclass,Sex'). Categorical features automatically label-encoded, missing values imputed.
+        n_features: Number of top features to select. Must be positive integer ≤ total features. Defaults to 5.
+
+    Returns:
+        Multi-line string with: selected top N features ranked by F-value score (higher = more predictive). Useful for dimensionality reduction and identifying key predictors. Returns error if columns not found, n_features invalid, or fewer features than requested.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        features = [col.strip() for col in feature_columns.split(',')]
+        
+        # Prepare data
+        X = df[features]
+        y = df[target_column]
+        
+        # Handle categorical features
+        for col in X.columns:
+            if X[col].dtype == 'object':
+                le = LabelEncoder()
+                X[col] = le.fit_transform(X[col].fillna('missing'))
+        
+        X = X.fillna(X.mean())
+        
+        if y.dtype == 'object':
+            le_target = LabelEncoder()
+            y = le_target.fit_transform(y)
+        
+        # Feature selection
+        selector = SelectKBest(score_func=f_classif, k=min(n_features, len(features)))
+        X_selected = selector.fit_transform(X, y)
+        
+        # Get selected features
+        selected_mask = selector.get_support()
+        selected_features = [f for f, s in zip(features, selected_mask) if s]
+        
+        # Get scores
+        feature_scores = dict(zip(features, selector.scores_))
+        top_features = sorted(feature_scores.items(), key=lambda x: x[1], reverse=True)[:n_features]
+        
+        # Save selected features dataset
+        df_selected = pd.concat([df[selected_features], df[target_column]], axis=1)
+        output_path = file_path.replace('.csv', '_selected_features.csv')
+        df_selected.to_csv(output_path, index=False)
+        
+        return f"Feature selection complete:\n  Selected {len(selected_features)} features: {selected_features}\n  Top scores: {top_features}\n  Saved to: {output_path}"
+    except Exception as e:
+        return f"Error in feature selection: {str(e)}"
+
+
+# ============================================================================
+# ANSWER GENERATION TOOLS
+# ============================================================================
+
+@tool
+def answer_survival_question(file_path: str, passenger_info: str) -> str:
+    """
+    Analyzes historical survival rates for Titanic passengers matching a natural language description.
+
+    Args:
+        file_path: Absolute or relative path to the Titanic CSV file. Must contain 'Survived', 'Sex', 'Pclass', and 'Age' columns.
+        passenger_info: Natural language passenger description (e.g., 'male, age 30, first class', 'female second class', 'woman age 25'). Supports gender (male/female/man/woman), class (first/second/third or 1/2/3), and age (±5 years tolerance).
+
+    Returns:
+        Multi-line string with: count of matching passengers, number survived, survival rate percentage, overall dataset survival rate, and relative survival ratio (e.g., '2.5x the average'). Returns 'No passengers found' if no matches. Useful for exploring historical survival patterns by demographic groups.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        
+        # Parse passenger info
+        info_lower = passenger_info.lower()
+        
+        # Extract features
+        conditions = []
+        
+        if 'male' in info_lower or 'man' in info_lower:
+            conditions.append(df['Sex'] == 'male')
+        elif 'female' in info_lower or 'woman' in info_lower:
+            conditions.append(df['Sex'] == 'female')
+        
+        if 'first class' in info_lower or 'class 1' in info_lower:
+            conditions.append(df['Pclass'] == 1)
+        elif 'second class' in info_lower or 'class 2' in info_lower:
+            conditions.append(df['Pclass'] == 2)
+        elif 'third class' in info_lower or 'class 3' in info_lower:
+            conditions.append(df['Pclass'] == 3)
+        
+        # Age extraction
+        import re
+        age_match = re.search(r'age (\d+)', info_lower)
+        if age_match:
+            age = int(age_match.group(1))
+            conditions.append((df['Age'] >= age - 5) & (df['Age'] <= age + 5))
+        
+        # Filter data
+        if conditions:
+            mask = conditions[0]
+            for cond in conditions[1:]:
+                mask = mask & cond
+            filtered = df[mask]
+        else:
+            filtered = df
+        
+        if len(filtered) == 0:
+            return "No passengers found matching the description"
+        
+        # Calculate survival rate
+        survival_rate = filtered['Survived'].mean()
+        total_matching = len(filtered)
+        survived = filtered['Survived'].sum()
+        
+        # Additional context
+        overall_survival = df['Survived'].mean()
+        
+        return f"Survival analysis for '{passenger_info}':\n  Matching passengers: {total_matching}\n  Survived: {survived}\n  Survival rate: {survival_rate:.1%}\n  Overall survival rate: {overall_survival:.1%}\n  Relative survival: {survival_rate/overall_survival:.2f}x the average"
+    except Exception as e:
+        return f"Error analyzing survival: {str(e)}"
+
+
+@tool
+def predict_single_passenger_survival(
+    file_path: str,
+    passenger_age: float,
+    passenger_sex: str,
+    passenger_class: int,
+    siblings_spouses: int = 0,
+    parents_children: int = 0,
+    fare: float = None
+) -> str:
+    """
+    Predicts survival probability for a single Titanic passenger based on their characteristics.
+
+    This specialized tool trains a Random Forest machine learning model on the complete Titanic
+    dataset and predicts survival probability for a hypothetical passenger. It provides detailed
+    breakdown with confidence levels, feature importance, and contextual comparison to historical rates.
+
+    Args:
+        file_path: Path to the Titanic CSV file
+        passenger_age: Age in years (0.1 to 120)
+        passenger_sex: Gender ('male' or 'female', case-insensitive)
+        passenger_class: Ticket class (1=First, 2=Second, 3=Third)
+        siblings_spouses: Number of siblings/spouses aboard (default: 0)
+        parents_children: Number of parents/children aboard (default: 0)
+        fare: Ticket fare in pounds (optional, uses class median if None)
+
+    Returns:
+        Comprehensive prediction report with probability, context, and interpretation
+    """
+    try:
+        # Input validation
+        passenger_sex = passenger_sex.lower().strip()
+        if passenger_sex not in ['male', 'female']:
+            return f"✗ Error: Invalid sex '{passenger_sex}'. Must be 'male' or 'female'"
+
+        if passenger_class not in [1, 2, 3]:
+            return f"✗ Error: Invalid class {passenger_class}. Must be 1, 2, or 3"
+
+        if not (0.1 <= passenger_age <= 120):
+            return f"✗ Error: Invalid age {passenger_age}. Must be between 0.1 and 120"
+
+        if siblings_spouses < 0 or parents_children < 0:
+            return "✗ Error: Family counts cannot be negative"
+
+        # Load dataset
+        df = pd.read_csv(file_path)
+
+        # Handle column names (lowercase/uppercase)
+        col_map = {col.lower(): col for col in df.columns}
+
+        # Check required columns
+        required = ['survived', 'pclass', 'sex', 'age']
+        if not all(req in col_map for req in required):
+            return f"✗ Error: Missing required columns"
+
+        # Prepare features
+        feature_names_orig = [col_map['pclass'], col_map['sex'], col_map['age']]
+        if 'sibsp' in col_map:
+            feature_names_orig.append(col_map['sibsp'])
+        if 'parch' in col_map:
+            feature_names_orig.append(col_map['parch'])
+        if 'fare' in col_map:
+            feature_names_orig.append(col_map['fare'])
+
+        # Create training dataset
+        df_train = df[[col_map['survived']] + feature_names_orig].copy()
+        df_train.columns = ['survived', 'pclass', 'sex', 'age'] + \
+                          (['sibsp'] if 'sibsp' in col_map else []) + \
+                          (['parch'] if 'parch' in col_map else []) + \
+                          (['fare'] if 'fare' in col_map else [])
+
+        # Handle missing values
+        for col in df_train.columns:
+            if col in ['age', 'fare']:
+                df_train[col] = df_train[col].fillna(df_train[col].median())
+            elif col == 'sex':
+                df_train[col] = df_train[col].fillna('male')
+
+        # Encode sex
+        df_train['sex'] = df_train['sex'].map({'male': 1, 'female': 0})
+
+        # Separate features and target
+        feature_cols = [c for c in df_train.columns if c != 'survived']
+        X = df_train[feature_cols]
+        y = df_train['survived']
+
+        # Train model
+        model = RandomForestClassifier(n_estimators=100, random_state=42, max_depth=10)
+        model.fit(X, y)
+
+        # Calculate metrics
+        train_acc = model.score(X, y)
+        cv_scores = cross_val_score(model, X, y, cv=5)
+
+        # Prepare passenger data
+        if fare is None and 'fare' in feature_cols:
+            class_fares = df_train[df_train['pclass'] == passenger_class]['fare']
+            fare = class_fares.median() if len(class_fares) > 0 else 0
+            fare_estimated = True
+        else:
+            fare_estimated = False
+
+        passenger_data = {
+            'pclass': passenger_class,
+            'sex': 1 if passenger_sex == 'male' else 0,
+            'age': passenger_age
+        }
+
+        if 'sibsp' in feature_cols:
+            passenger_data['sibsp'] = siblings_spouses
+        if 'parch' in feature_cols:
+            passenger_data['parch'] = parents_children
+        if 'fare' in feature_cols:
+            passenger_data['fare'] = fare if fare is not None else 0
+
+        passenger_df = pd.DataFrame([passenger_data])[feature_cols]
+
+        # Make prediction
+        survival_prob = model.predict_proba(passenger_df)[0][1]
+        prediction = model.predict(passenger_df)[0]
+
+        # Get feature importance
+        importances = list(zip(feature_cols, model.feature_importances_))
+        importances.sort(key=lambda x: x[1], reverse=True)
+
+        # Calculate historical rates
+        overall_survival = y.mean()
+        sex_survival = df_train[df_train['sex'] == passenger_data['sex']]['survived'].mean()
+        class_sex_survival = df_train[
+            (df_train['pclass'] == passenger_class) &
+            (df_train['sex'] == passenger_data['sex'])
+        ]['survived'].mean()
+
+        # Find similar passengers
+        similar = df_train[
+            (df_train['pclass'] == passenger_class) &
+            (df_train['sex'] == passenger_data['sex']) &
+            (df_train['age'].between(passenger_age - 5, passenger_age + 5))
+        ]
+
+        # Build result
+        class_names = {
+            1: "1st class (First/Upper)",
+            2: "2nd class (Second/Middle)",
+            3: "3rd class (Third/Working)"
+        }
+
+        result = [
+            "",
+            "🚢 Survival Prediction for Titanic Passenger",
+            "=" * 60,
+            "",
+            "👤 Passenger Profile:",
+            f"   • Age: {passenger_age} years old",
+            f"   • Sex: {passenger_sex.capitalize()}",
+            f"   • Class: {class_names[passenger_class]}",
+            f"   • Family: {siblings_spouses} siblings/spouses, {parents_children} parents/children",
+        ]
+
+        if 'fare' in feature_cols:
+            fare_str = f"£{fare:.2f}"
+            if fare_estimated:
+                fare_str += " (estimated)"
+            result.append(f"   • Fare: {fare_str}")
+
+        result.extend([
+            "",
+            "🎯 Prediction Results:",
+            f"   • Survival Probability: {survival_prob*100:.1f}%",
+            f"   • Prediction: {'✓ SURVIVED' if prediction == 1 else '✗ DID NOT SURVIVE'}",
+        ])
+
+        # Confidence
+        if survival_prob > 0.75:
+            conf_desc = "Very High"
+            conf_emoji = "🟢"
+        elif survival_prob > 0.60:
+            conf_desc = "High"
+            conf_emoji = "🟢"
+        elif survival_prob > 0.45:
+            conf_desc = "Uncertain"
+            conf_emoji = "🟡"
+        else:
+            conf_desc = "Low"
+            conf_emoji = "🔴"
+
+        result.append(f"   • Confidence: {conf_emoji} {conf_desc}")
+        result.append("")
+
+        # Feature importance
+        result.append("📊 Feature Importance:")
+        feature_names_pretty = {
+            'sex': 'Sex',
+            'pclass': 'Class',
+            'age': 'Age',
+            'fare': 'Fare',
+            'sibsp': 'Siblings/Spouses',
+            'parch': 'Parents/Children'
+        }
+
+        for idx, (feat, imp) in enumerate(importances[:5], 1):
+            result.append(f"   {idx}. {feature_names_pretty.get(feat, feat)}: {imp*100:.1f}%")
+
+        result.append("")
+
+        # Historical context
+        result.extend([
+            "📜 Historical Context:",
+            f"   • Overall survival: {overall_survival*100:.1f}%",
+            f"   • {passenger_sex.capitalize()} survival: {sex_survival*100:.1f}%",
+            f"   • {class_names[passenger_class].split('(')[0].strip()} {passenger_sex}: {class_sex_survival*100:.1f}%",
+        ])
+
+        if class_sex_survival > 0:
+            ratio = survival_prob / class_sex_survival
+            if ratio > 1.2:
+                result.append(f"   → Your profile: {ratio:.1f}x BETTER than average")
+            elif ratio < 0.8:
+                result.append(f"   → Your profile: {1/ratio:.1f}x WORSE than average")
+
+        result.append("")
+
+        # Similar passengers
+        if len(similar) > 0:
+            similar_survived = similar['survived'].sum()
+            result.extend([
+                f"👥 Similar Passengers (Age {max(0, passenger_age-5):.0f}-{passenger_age+5:.0f}):",
+                f"   • Found: {len(similar)} passengers",
+                f"   • Survived: {int(similar_survived)} ({similar_survived/len(similar)*100:.1f}%)",
+                ""
+            ])
+
+        # Model performance
+        result.extend([
+            "🔬 Model Performance:",
+            f"   • Training accuracy: {train_acc*100:.1f}%",
+            f"   • Cross-validation: {cv_scores.mean()*100:.1f}% ± {cv_scores.std()*100:.1f}%",
+            "",
+            "=" * 60
+        ])
+
+        return "\n".join(result)
+
+    except FileNotFoundError:
+        return f"✗ Error: File not found at '{file_path}'"
+    except Exception as e:
+        return f"✗ Error: {type(e).__name__}: {str(e)}"
+
+
+@tool
+def get_dataset_insights(file_path: str) -> str:
+    """
+    Generates automated data quality and exploratory insights with special Titanic-specific survival analysis.
+
+    Args:
+        file_path: Absolute or relative path to the CSV file to analyze. Works with any dataset; provides enhanced insights for Titanic data (detects 'Survived', 'Sex', 'Pclass' columns).
+
+    Returns:
+        Bulleted multi-line string with: dataset dimensions, top 3 columns with missing values, numeric/categorical column lists, and Titanic-specific insights (overall survival rate, survival by gender, survival by class). Provides quick exploratory overview. Returns error if file unreadable.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        
+        insights = []
+        
+        # Basic info
+        insights.append(f"Dataset has {len(df)} rows and {len(df.columns)} columns")
+        
+        # Missing data
+        missing = df.isnull().sum()
+        if missing.sum() > 0:
+            worst_missing = missing.nlargest(3)
+            insights.append(f"Missing data in: {worst_missing.to_dict()}")
+        
+        # For Titanic specific insights
+        if 'Survived' in df.columns:
+            survival_rate = df['Survived'].mean()
+            insights.append(f"Overall survival rate: {survival_rate:.1%}")
+            
+            if 'Sex' in df.columns:
+                female_survival = df[df['Sex'] == 'female']['Survived'].mean()
+                male_survival = df[df['Sex'] == 'male']['Survived'].mean()
+                insights.append(f"Female survival: {female_survival:.1%}, Male survival: {male_survival:.1%}")
+            
+            if 'Pclass' in df.columns:
+                class_survival = df.groupby('Pclass')['Survived'].mean()
+                insights.append(f"Survival by class: {class_survival.to_dict()}")
+        
+        # Numeric columns
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        insights.append(f"Numeric columns: {list(numeric_cols)}")
+        
+        # Categorical columns
+        cat_cols = df.select_dtypes(include=['object']).columns
+        insights.append(f"Categorical columns: {list(cat_cols)}")
+        
+        return "Dataset Insights:\n" + "\n".join(f"• {insight}" for insight in insights)
+    except Exception as e:
+        return f"Error generating insights: {str(e)}"
+

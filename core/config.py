@@ -25,7 +25,7 @@ class Config:
         self.huggingface_token: Optional[str] = os.getenv("HUGGINGFACE_TOKEN")
         
         # Application Configuration
-        self.max_tokens: int = int(os.getenv("MAX_TOKENS", "512"))
+        self.max_tokens: int = int(os.getenv("MAX_TOKENS", "1024"))
         self.temperature: float = float(os.getenv("TEMPERATURE", "0.1"))
         
         # Data Configuration

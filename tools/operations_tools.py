@@ -222,7 +222,7 @@ def aggregate_data(file_path: str, group_by_columns: str, agg_column: str, agg_f
         file_path: Path to the data file
         group_by_columns: Comma-separated list of columns to group by
         agg_column: Column to aggregate
-        agg_function: Aggregation function (mean, sum, count, min, max, std, median)
+        agg_function: Aggregation function one of mean, sum, count, min, max, std, median
         
     Returns:
         String describing the aggregation performed

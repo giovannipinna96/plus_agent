@@ -1,4 +1,4 @@
-"""Gradio interface for the multi-agent data analysis system."""
+"""Gradio interface for the multi-agent data analysis system using smolagents."""
 
 import gradio as gr
 import pandas as pd
@@ -13,13 +13,26 @@ from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
 from contextlib import redirect_stdout, redirect_stderr
 
-# Import core components
-from core.config import config
-from core.orchestrator import MultiAgentOrchestrator
-from core.llm_wrapper import llm_wrapper
+# Import smolagents system
+from smolagents import CodeAgent, TransformersModel
+from dotenv import load_dotenv
 
-# Initialize the orchestrator
-orchestrator = None
+# Load environment variables
+load_dotenv()
+
+# Configuration
+CONFIG = {
+   # "model_id": os.getenv("MODEL_NAME", "Qwen/Qwen2.5-Coder-7B-Instruct"),
+    "model_id": os.getenv("MODEL_NAME", "meta-llama/Llama-3.2-3B-Instruct"),
+    "max_new_tokens": int(os.getenv("MAX_TOKENS", "1024")),
+    "temperature": float(os.getenv("TEMPERATURE", "0.1")),
+    "default_dataset": os.getenv("DEFAULT_DATASET_PATH", "data/titanic.csv"),
+    "huggingface_token": os.getenv("HUGGINGFACE_TOKEN"),
+}
+
+# Global variables
+model = None
+manager_agent = None
 
 
 def get_available_models() -> List[str]:
@@ -30,65 +43,74 @@ def get_available_models() -> List[str]:
         "microsoft/Phi-4-mini-instruct",
         "meta-llama/Llama-3.2-3B-Instruct",
         "mistralai/Mistral-7B-Instruct-v0.3",
-        "google/gemma-2-9b-it"
     ]
+
+
+def create_smolagent_system(model_name: str):
+    """Create the smolagent multi-agent system."""
+    from smolagents_multiagent_system import create_agents, create_manager_agent
+
+    print("🔧 Initializing Model...")
+
+    # Initialize the LLM model
+    model = TransformersModel(
+        model_id=model_name,
+        temperature=CONFIG["temperature"],
+        max_new_tokens=CONFIG["max_new_tokens"],
+        trust_remote_code=True,
+        token=CONFIG["huggingface_token"]
+    )
+
+    print(f"✅ Model initialized: {model_name}")
+    print("\n🤖 Creating Specialized Agents...")
+
+    # Create specialized agents
+    model_instance, data_reader, data_manipulation, statistical_agent, visualization_agent, ml_prediction, answer_agent = create_agents()
+
+    # Create manager agent
+    print("\n👔 Creating Manager Agent (Orchestrator)...")
+    manager = create_manager_agent(model_instance, data_reader, data_manipulation, statistical_agent, visualization_agent, ml_prediction, answer_agent)
+
+    print("✅ All agents created successfully!")
+
+    return model_instance, manager
 
 
 def initialize_system(model_name: str = None):
     """Initialize the multi-agent system with optional model selection."""
-    global orchestrator
+    global model, manager_agent, CONFIG
+
     try:
         print("\n" + "="*60)
-        print("Initializing multi-agent system...")
+        print("Initializing smolagent multi-agent system...")
         print("="*60 + "\n")
 
-        # Setup LangSmith if configured
-        config.setup_langsmith()
-
         # Update model if specified
-        if model_name and model_name != config.model_name:
-            print(f"Switching model from {config.model_name} to {model_name}...")
+        if model_name:
+            CONFIG["model_id"] = model_name
 
-            # Update config
-            config.model_name = model_name
+        current_model = CONFIG["model_id"]
 
-            # Reload the global LLM wrapper with new model
-            llm_wrapper.reload_model(model_name)
-
-        # Force LLM loading into memory (lazy loading)
-        print(f"📦 Loading LLM model into VRAM: {config.model_name}")
+        # Load model into memory
+        print(f"📦 Loading LLM model into VRAM: {current_model}")
         print("⏳ This may take 5-10 seconds on first load...")
 
-        import time
         start_time = time.time()
 
-        # Access the llm property to trigger loading
-        llm_instance = llm_wrapper.llm
+        # Create the smolagent system
+        model, manager_agent = create_smolagent_system(current_model)
 
         load_time = time.time() - start_time
-        print(f"✅ LLM loaded successfully in {load_time:.2f} seconds")
-
-        # Quick test to verify LLM is working
-        print("\n🔧 Testing LLM inference...")
-        test_start = time.time()
-        test_response = llm_instance._call("Answer briefly: What is 2+2? Just the number.")
-        test_time = time.time() - test_start
-        print(f"✅ LLM inference test successful in {test_time:.2f} seconds")
-        print(f"   Response: {test_response[:100]}...")
-
-        # Initialize/reinitialize the orchestrator
-        # This will create new agents that use the updated global llm_wrapper
-        print("\n🤖 Initializing agents...")
-        orchestrator = MultiAgentOrchestrator()
+        print(f"✅ System loaded successfully in {load_time:.2f} seconds")
 
         print(f"\n{'='*60}")
         print(f"✅ Multi-agent system initialized successfully!")
-        print(f"   Model: {config.model_name}")
+        print(f"   Model: {current_model}")
         print(f"   Load time: {load_time:.2f}s")
-        print(f"   Test time: {test_time:.2f}s")
         print(f"{'='*60}\n")
 
-        return True, f"System initialized with model: {config.model_name}"
+        return True, f"System initialized with model: {current_model}"
+
     except Exception as e:
         error_msg = f"Failed to initialize system: {e}"
         print(f"\n{'='*60}")
@@ -101,7 +123,7 @@ def initialize_system(model_name: str = None):
 
 def process_user_request(message: str, uploaded_file, model_choice: str) -> Tuple[str, str, str]:
     """
-    Process user request through the multi-agent system.
+    Process user request through the smolagent multi-agent system.
 
     Args:
         message: User's message/request
@@ -111,7 +133,7 @@ def process_user_request(message: str, uploaded_file, model_choice: str) -> Tupl
     Returns:
         Tuple of (response_text, logs_text, status_message)
     """
-    global orchestrator
+    global manager_agent, CONFIG
 
     try:
         # Validate inputs
@@ -157,68 +179,71 @@ def process_user_request(message: str, uploaded_file, model_choice: str) -> Tupl
                 return "", "", error_msg
         else:
             # Use default Titanic dataset
-            file_path = config.default_dataset_path
+            file_path = CONFIG["default_dataset"]
             if not os.path.exists(file_path):
                 error_msg = "Error: Default dataset not found. Please upload a file."
                 return "", "", error_msg
 
         # Reinitialize if model changed
-        if model_choice and model_choice != config.model_name:
+        if model_choice and model_choice != CONFIG["model_id"]:
             status_msg += f"\n\nReinitializing system with model: {model_choice}..."
             success, init_msg = initialize_system(model_choice)
             if not success:
                 return "", "", f"Error: {init_msg}"
             status_msg += f"\n{init_msg}"
 
-        # Check orchestrator
-        if orchestrator is None:
+        # Check manager agent
+        if manager_agent is None:
             error_msg = "Error: System not initialized. Please refresh the page."
             return "", "", error_msg
 
         status_msg += f"\n\nProcessing request: '{message}...'"
 
-        # Setup comprehensive logging capture
-        import logging
-
-        log_capture = io.StringIO()
-        log_handler = logging.StreamHandler(log_capture)
-        log_handler.setLevel(logging.DEBUG)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        log_handler.setFormatter(formatter)
-
-        # Capture logs from relevant loggers
-        loggers_to_capture = [
-            logging.getLogger('langchain'),
-            logging.getLogger('langchain.agents'),
-            logging.getLogger('langchain_core'),
-            logging.getLogger(__name__),
-            logging.getLogger('plus_agent'),
-            logging.getLogger('agents'),
-            logging.getLogger('core')
-        ]
-
-        for logger in loggers_to_capture:
-            logger.addHandler(log_handler)
-            logger.setLevel(logging.DEBUG)
-
-        # Also capture stdout/stderr for print statements
+        # Capture stdout/stderr for print statements
         stdout_capture = io.StringIO()
         stderr_capture = io.StringIO()
 
         try:
             print(f"\n{'='*60}")
-            print(f"🚀 STARTING ANALYSIS")
+            print(f"🚀 STARTING ANALYSIS (smolagents)")
             print(f"   Prompt: {message}")
             print(f"   File: {file_path}")
             print(f"{'='*60}\n")
 
+            # Format the task for the manager
+            task = f"""
+Task: {message}
+Data file: {file_path}
+
+IMPORTANT INSTRUCTIONS:
+- You MUST ONLY use the tools and agents that have been explicitly provided to you
+- DO NOT invent, create, or imagine new tools, functions, or agents
+- DO NOT attempt to use tools or methods that are not in the provided list
+- If you cannot complete a task with the available tools, state this clearly
+
+You have access to ONLY these specialized agents:
+- data_reader: For reading and exploring the dataset (tools: read_csv_file, read_json_file, get_column_info, get_data_summary, preview_data)
+- data_manipulation: For data cleaning and preprocessing (tools: handle_missing_values, create_dummy_variables, modify_column_values, convert_data_types)
+- data_operations: For mathematical operations and aggregations (tools: filter_data, perform_math_operations, aggregate_data, string_operations)
+- ml_prediction: For training and evaluating machine learning models (tools: train_regression_model, train_svm_model, train_random_forest_model, train_knn_model, evaluate_model)
+
+Analyze the task and delegate work ONLY to the appropriate agents listed above in the correct order.
+Use ONLY the tools available to each agent. Do ONLY what is required of you, nothing more.
+Provide a comprehensive final answer with all results.
+"""
+
             with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-                result = orchestrator.run_analysis(message, file_path)
+                # Run the manager agent
+                result = manager_agent.run(task)
 
             print(f"\n{'='*60}")
             print(f"✅ ANALYSIS COMPLETED")
-            print(f"   Status: {result.get('status')}")
             print(f"{'='*60}\n")
+
+            # Format the response
+            response = f"## 🎯 Analysis Results\n\n{result}\n"
+
+            status_msg += "\n\n✅ Request processed successfully!"
 
         except Exception as e:
             print(f"\n{'='*60}")
@@ -227,11 +252,10 @@ def process_user_request(message: str, uploaded_file, model_choice: str) -> Tupl
             print(f"{'='*60}\n")
             import traceback
             traceback.print_exc()
-            result = {"status": "error", "error": str(e)}
-        finally:
-            # Remove logging handlers
-            for logger in loggers_to_capture:
-                logger.removeHandler(log_handler)
+
+            error_msg = str(e)
+            response = f"❌ **Error:**\n{error_msg}"
+            status_msg += f"\n\n❌ Error: {error_msg}"
 
         # Combine all logs
         logs = ""
@@ -241,109 +265,20 @@ def process_user_request(message: str, uploaded_file, model_choice: str) -> Tupl
         if stdout_content:
             logs += f"=== STDOUT (Print Statements) ===\n{stdout_content}\n"
 
-        # Add captured logging
-        log_content = log_capture.getvalue()
-        if log_content:
-            logs += f"\n=== LOGGING (LangChain & Agents) ===\n{log_content}\n"
-
         # Add stderr if any
         stderr_content = stderr_capture.getvalue()
         if stderr_content:
             logs += f"\n=== STDERR (Errors & Warnings) ===\n{stderr_content}\n"
 
         if not logs.strip():
-            logs = "⚠️ No logs captured during execution. This might indicate a problem with the system."
-
-        # Format the response with comprehensive error handling
-        if result["status"] == "success":
-            response_parts = []
-
-            # Add execution plan
-            if result.get("execution_plan"):
-                response_parts.append(f"📋 **Execution Plan:**\n{result['execution_plan']}\n")
-
-            # Add agent results with robust handling
-            agent_results = result.get("agent_results", {})
-
-            if not agent_results:
-                response_parts.append("⚠️ **Warning**: No agent results returned!")
-                response_parts.append("\n**Debug Information:**")
-                response_parts.append(f"- Completed steps: {result.get('completed_steps', [])}")
-                response_parts.append(f"- Messages: {len(result.get('messages', []))}")
-
-            for agent_name, agent_result in agent_results.items():
-                response_parts.append(f"\n{'='*50}")
-                response_parts.append(f"🤖 **{agent_name.replace('_', ' ').title()} Agent**")
-                response_parts.append(f"{'='*50}")
-
-                # Check agent status
-                status = agent_result.get("status", "unknown")
-                response_parts.append(f"**Status:** {status.upper()}")
-
-                if status == "success":
-                    # Try to extract the main result
-                    content_found = False
-
-                    if agent_name == "data_reader" and "analysis" in agent_result:
-                        response_parts.append(f"\n{agent_result['analysis']}")
-                        content_found = True
-                    elif agent_name == "planner" and "plan" in agent_result:
-                        response_parts.append(f"\n{agent_result['plan']}")
-                        content_found = True
-                    elif "result" in agent_result:
-                        response_parts.append(f"\n{agent_result['result']}")
-                        content_found = True
-
-                    # Fallback: show all available data
-                    if not content_found:
-                        response_parts.append("\n**Available data:**")
-                        for key, value in agent_result.items():
-                            if key not in ["status", "agent_type", "file_path"]:
-                                response_parts.append(f"- {key}: {str(value)[:200]}...")
-
-                elif status == "error":
-                    # Show error clearly
-                    error_msg = agent_result.get("error", "Unknown error")
-                    response_parts.append(f"\n❌ **Error:** {error_msg}")
-
-                else:
-                    # Unknown status - show everything
-                    response_parts.append(f"\n⚠️ **Unknown status**")
-                    response_parts.append(f"```json\n{json.dumps(agent_result, indent=2)}\n```")
-
-                response_parts.append("")  # Add spacing
-
-            # If no content was added, show messages
-            if len(response_parts) <= 1 and result.get("messages"):
-                response_parts.append("\n📝 **Agent Messages:**")
-                for msg in result.get("messages", []):
-                    response_parts.append(f"- {msg}")
-
-            # Combine all parts
-            if response_parts and len(response_parts) > 1:
-                response = "\n".join(response_parts)
-            else:
-                # Still no content - show debug info
-                response = "⚠️ **No content generated**\n\n"
-                response += "**Debug Information:**\n"
-                response += f"- Status: {result.get('status')}\n"
-                response += f"- Agent results count: {len(agent_results)}\n"
-                response += f"- Completed steps: {result.get('completed_steps', [])}\n"
-                response += f"- Messages count: {len(result.get('messages', []))}\n"
-                response += f"\n**Raw result:**\n```json\n{json.dumps(result, indent=2)}\n```"
-
-            status_msg += "\n\n✅ Request processed successfully!"
-
-        else:
-            # Handle error
-            error_msg = result.get('error', 'Unknown error occurred')
-            response = f"❌ **Error:**\n{error_msg}"
-            status_msg += f"\n\n❌ Error: {error_msg}"
+            logs = "⚠️ No logs captured during execution."
 
         return response, logs, status_msg
 
     except Exception as e:
         error_msg = f"Error processing request: {str(e)}"
+        import traceback
+        traceback.print_exc()
         return f"❌ **Error:**\n{error_msg}", "", f"❌ {error_msg}"
 
 
@@ -351,12 +286,12 @@ def handle_file_upload(file) -> str:
     """Handle file upload and return file information."""
     if file is None:
         return "No file uploaded. Using default Titanic dataset."
-    
+
     try:
         # Get file info
         file_name = os.path.basename(file.name)
         file_size = os.path.getsize(file.name)
-        
+
         # Check file format
         if file.name.endswith('.csv'):
             df = pd.read_csv(file.name)
@@ -371,14 +306,14 @@ def handle_file_upload(file) -> str:
                     return f"JSON file format not supported. Please upload a JSON array."
         else:
             return "Unsupported file format. Please upload CSV or JSON files."
-        
+
         return f"📁 **File Uploaded Successfully!**\n\n" \
                f"**Name:** {file_name}\n" \
                f"**Type:** {file_type}\n" \
                f"**Size:** {file_size:,} bytes\n" \
                f"**Shape:** {df.shape[0]:,} rows × {df.shape[1]} columns\n" \
                f"**Columns:** {', '.join(list(df.columns)[:10])}{'...' if len(df.columns) > 10 else ''}"
-               
+
     except Exception as e:
         return f"Error reading file: {str(e)}"
 
@@ -389,11 +324,11 @@ def get_sample_prompts() -> List[List[str]]:
         ["Show me the basic information about this dataset"],
         ["What are the data types and missing values in each column?"],
         ["Provide summary statistics for numerical columns"],
-        
+
         ["Calculate the average age by gender"],
         ["Create dummy variables for categorical columns and handle missing values"],
         ["Filter passengers who survived and analyze their characteristics"],
-        
+
         ["Train a random forest model to predict survival and show feature importance"],
         ["Compare the performance of different ML models for classification"],
         ["Perform a complete analysis: data exploration, preprocessing, and predictive modeling"]
@@ -404,7 +339,7 @@ def create_interface():
     """Create the Gradio interface with enhanced user experience."""
 
     with gr.Blocks(
-        title="Multi-Agent Data Analysis System",
+        title="Multi-Agent Data Analysis System (smolagents)",
         theme=gr.themes.Soft(),
         css="""
         .gradio-container {
@@ -441,7 +376,7 @@ def create_interface():
             <div class="header">
                 <h1>🤖 Multi-Agent Data Analysis System</h1>
                 <p style="font-size: 18px; margin-top: 10px;">
-                    Powered by LangChain, LangGraph, and Advanced LLMs
+                    Powered by smolagents and HuggingFace Transformers
                 </p>
             </div>
         """)
@@ -454,7 +389,7 @@ def create_interface():
 
                 model_dropdown = gr.Dropdown(
                     choices=get_available_models(),
-                    value=config.model_name,
+                    value=CONFIG["model_id"],
                     label="Select LLM Model",
                     info="Choose the language model for analysis"
                 )
@@ -525,7 +460,7 @@ def create_interface():
                     elem_classes="response-box"
                 )
 
-                gr.Markdown("### 🔧 System Logs & Tool Calls")
+                gr.Markdown("### 🔧 System Logs & Agent Output")
 
                 logs_output = gr.Textbox(
                     label="Execution Logs",
@@ -541,12 +476,12 @@ def create_interface():
 
                 gr.Markdown("""
                 ---
-                **Available Agents:**
+                **Available Agents (smolagents):**
                 - 📊 **Data Reader**: Dataset analysis, column info, summaries
                 - 🔧 **Data Manipulation**: Data preprocessing, feature engineering
                 - ⚡ **Data Operations**: Filtering, aggregation, calculations
                 - 🎯 **ML Prediction**: Model training and evaluation
-                - 🎭 **Planner**: Workflow orchestration
+                - 👔 **Manager**: Orchestrates all specialized agents
                 """)
 
         # Event Handlers
@@ -583,11 +518,11 @@ def main():
     """Main function to run the Gradio app."""
 
     print("\n" + "="*60)
-    print("🚀 Starting Multi-Agent Data Analysis System")
+    print("🚀 Starting Multi-Agent Data Analysis System (smolagents)")
     print("="*60 + "\n")
 
     # Initialize the system with default model
-    print(f"📦 Initializing with default model: {config.model_name}")
+    print(f"📦 Initializing with default model: {CONFIG['model_id']}")
     success, msg = initialize_system()
 
     if not success:
@@ -599,17 +534,17 @@ def main():
     # Create and launch the interface
     interface = create_interface()
 
-    # print("\n" + "="*60)
-    # print("🌐 Launching Gradio Interface")
-    # print("="*60)
-    # print(f"📍 Local URL: http://localhost:7860")
-    # print(f"📍 Network URL: http://0.0.0.0:7860")
-    # print("="*60 + "\n")
+    print("\n" + "="*60)
+    print("🌐 Launching Gradio Interface")
+    print("="*60)
+    #print(f"📍 Local URL: http://localhost:7861")
+    #print(f"📍 Network URL: http://0.0.0.0:7861")
+    #print("="*60 + "\n")
 
     # Launch with custom settings
     interface.launch(
         server_name="0.0.0.0",
-        server_port=7860,
+        server_port=7861,  # Different port to avoid conflict with app.py
         share=True,  # Set to True to create public link
         show_api=False,
         debug=True,

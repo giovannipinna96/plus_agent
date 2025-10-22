@@ -23,37 +23,81 @@ class DataReaderAgent:
             preview_data
         ]
         
-        # Create the data reader prompt
+        # Create the data reader prompt with explicit ReAct format
         self.prompt = PromptTemplate(
             template="""You are a Data Reading Agent specialized in reading and analyzing datasets. Your job is to help users understand their data by providing detailed information about files, columns, and data characteristics.
 
-You can:
-- Read CSV and JSON files
-- Provide column information (types, missing values, unique values)
-- Generate data summaries with statistics
-- Preview data samples
-- Identify data quality issues
+You have access to these tools:
+- read_csv_file: Read CSV files and get basic information
+- read_json_file: Read JSON files and convert to DataFrame
+- get_column_info: Get detailed column information (types, missing values, unique values)
+- get_data_summary: Generate statistical summaries (mean, median, std, etc.)
+- preview_data: Show sample rows from the dataset
 
-Always be thorough in your analysis and provide actionable insights about the data.
+IMPORTANT: You MUST follow the ReAct format exactly. Use this structure:
+
+Thought: [Your reasoning about what to do]
+Action: [The tool name to use, must be one of: {tool_names}]
+Action Input: [The input string for the tool]
+
+STOP HERE! Do NOT write "Observation:" - the system will provide it automatically.
+
+After the system provides the Observation, you can continue with:
+Thought: I now know the final answer
+Final Answer: [Your comprehensive data analysis]
+
+EXAMPLES:
+
+Example 1 - First Step (you generate this):
+Task: Perform a comprehensive analysis of the dataset at data/titanic.csv
+Thought: I need to start by reading the CSV file to understand the basic structure of the dataset.
+Action: read_csv_file
+Action Input: data/titanic.csv
+
+(Then the system will run the tool and provide the Observation)
+
+Example 1 - After Observation (you continue):
+Observation: Successfully read CSV file: data/titanic.csv
+Shape: (891, 12) - 891 rows and 12 columns
+Columns: PassengerId, Survived, Pclass, Name, Sex, Age, SibSp, Parch, Ticket, Fare, Cabin, Embarked
+Thought: Now I have the basic file information. I should get detailed column information to understand data types and missing values.
+Action: get_column_info
+Action Input: data/titanic.csv
+
+(Then the system will provide another Observation, and you continue this process)
+
+Example 2 - First Step (you generate this):
+Task: Provide basic information about the dataset at uploads/mydata.csv
+Thought: I'll start by reading the CSV file to get an overview of the dataset structure.
+Action: read_csv_file
+Action Input: uploads/mydata.csv
+
+(Then the system will run the tool and provide the Observation)
+
+NOW, answer the user's task following the exact format above.
 
 Available tools: {tool_names}
 {tools}
 
 Task: {input}
 
-{agent_scratchpad}
-
-Provide a comprehensive analysis of the requested data.""",
+{agent_scratchpad}""",
             input_variables=["input", "agent_scratchpad", "tools", "tool_names"]
         )
         
-        # Create the agent
+        # Create the agent with strict configuration
         self.agent = create_react_agent(self.llm, self.tools, self.prompt)
+
+        # Create agent executor with strict configuration
+        # NO handle_parsing_errors - we want strict format compliance
         self.agent_executor = AgentExecutor(
             agent=self.agent,
             tools=self.tools,
             verbose=True,
-            max_iterations=5
+            max_iterations=5,
+            handle_parsing_errors=False,  # NO fallback - enforce strict format
+            # early_stopping_method="generate",  # Stop early if we have an answer
+            return_intermediate_steps=True  # For debugging
         )
     
     def analyze_data(self, file_path: str, analysis_type: str = "comprehensive") -> Dict[str, Any]:
